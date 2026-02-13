@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+
+# Environment variables (API keys, secrets)
+.env
+
+# Logs
+logs/
+trade_bot.log*
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
