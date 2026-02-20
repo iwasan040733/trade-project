@@ -186,6 +186,14 @@ QQQ_WEAK_BEAR_LOW = 0.40             # 弱気ゾーン下限（VWAP下抜けで�
 QQQ_WEAK_BEAR_HIGH = 0.50            # 弱気ゾーン上限
 GRAY_ZONE_SL_TIGHTEN_PCT = 0.20      # グレーゾーンでのSL縮小率 20%
 
+# サーキットブレイカー（急な反転に即時反応）
+QQQ_CB_BARS = 3                       # 直近N本の変化率で判定（3本=15分）
+QQQ_CB_THRESHOLD_DOWN = -0.005        # 下方向閾値 -0.5% → bearish
+QQQ_CB_THRESHOLD_UP = 0.005           # 上方向閾値 +0.5% → bullish
+
+# レジームロック（チャタリング防止）
+QQQ_REGIME_LOCK_SECONDS = 900         # レジーム変更後15分間はロック
+
 VIX_PANIC_ENABLED = True
 VIX_PANIC_THRESHOLD = 0.10            # VIX 前日比 +10% でパニックモード
 VIX_SYMBOL = "^VIX"                   # yfinance 用シンボル

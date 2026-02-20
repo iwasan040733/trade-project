@@ -715,3 +715,56 @@ def calc_qqq_bullish_ratio(df_5min: pd.DataFrame, window: int = 20) -> pd.Series
     is_bullish = (close > ma20).astype(float)
     ratio = is_bullish.rolling(window, min_periods=1).mean()
     return ratio
+
+
+def calc_qqq_regime_hybrid(
+    df_5min: pd.DataFrame,
+    *,
+    window: int = 20,
+    cb_bars: int = 3,
+    cb_threshold_down: float = -0.005,
+    cb_threshold_up: float = 0.005,
+    gray_zone_low: float = 0.45,
+    gray_zone_high: float = 0.55,
+) -> tuple[str, str, float]:
+    """2層ハイブリッドQQQレジーム判定。
+
+    Layer 1 (最優先): サーキットブレイカー — 直近cb_bars本の変化率が閾値を超えたら即時反応
+    Layer 2 (ベース): ローリング比率 — 大局トレンドを安定判定（Bullish / Bearish / Gray）
+
+    Args:
+        df_5min: close カラムを持つ QQQ の5分足 DataFrame
+        window: ローリング比率のウィンドウ（Layer 2）
+        cb_bars: サーキットブレイカーで参照する本数（Layer 1）
+        cb_threshold_down: 下方向の発動閾値（例: -0.005 = -0.5%）
+        cb_threshold_up: 上方向の発動閾値（例: +0.005 = +0.5%）
+        gray_zone_low: ローリング比率の bearish 閾値
+        gray_zone_high: ローリング比率の bullish 閾値
+
+    Returns:
+        tuple(regime, source, ratio)
+        - regime: "bullish" | "bearish" | "gray"
+        - source: "circuit_breaker" | "rolling"
+        - ratio: ローリング比率（0.0〜1.0、表示・ログ用）
+    """
+    close = df_5min["close"].astype(float)
+
+    # Layer 2: ローリング比率（常に計算、フォールバック兼表示用）
+    ratio = float(calc_qqq_bullish_ratio(df_5min, window=window).iloc[-1])
+
+    # Layer 1: サーキットブレイカー（直近N本の変化率）
+    if len(close) >= cb_bars + 1:
+        ref_price = float(close.iloc[-(cb_bars + 1)])
+        if ref_price > 0:
+            cb_change = (float(close.iloc[-1]) - ref_price) / ref_price
+            if cb_change <= cb_threshold_down:
+                return "bearish", "circuit_breaker", ratio
+            if cb_change >= cb_threshold_up:
+                return "bullish", "circuit_breaker", ratio
+
+    # Layer 2: ローリング比率
+    if ratio > gray_zone_high:
+        return "bullish", "rolling", ratio
+    if ratio < gray_zone_low:
+        return "bearish", "rolling", ratio
+    return "gray", "rolling", ratio

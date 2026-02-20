@@ -154,7 +154,7 @@ def fetch_bars(client, symbol, timeframe, days):
 # ============================================================
 #  メインバックテスト
 # ============================================================
-def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_override=None):
+def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_override=None, legacy_regime=False):
     client = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
     btc_enabled = btc_filter_override if btc_filter_override is not None else config.BTC_REGIME_ENABLED
 
@@ -167,6 +167,33 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
     qqq_5min = fetch_bars(client, "QQQ", TimeFrame(5, TimeFrameUnit.Minute), days)
     log.info(f"QQQ 5分足={len(qqq_5min)}本")
     ratio_series = calc_qqq_bullish_ratio(qqq_5min, window=config.QQQ_BULLISH_RATIO_WINDOW)
+
+    # ハイブリッドレジーム用: サーキットブレイカー
+    _qqq_close = qqq_5min["close"].astype(float)
+    _cb_change_series = _qqq_close.pct_change(periods=config.QQQ_CB_BARS)
+
+    def _qqq_regime_at(ts) -> tuple[str, float]:
+        """バー時刻 ts 時点のQQQレジームを返す。legacy_regime=True でローリング比率のみ使用。"""
+        prior = ratio_series.index <= ts
+        ratio = float(ratio_series[prior].iloc[-1]) if prior.any() else 0.5
+
+        # Layer 1: サーキットブレイカー
+        if not legacy_regime:
+            cb_prior = _cb_change_series.index <= ts
+            if cb_prior.any():
+                cb_change = float(_cb_change_series[cb_prior].iloc[-1])
+                if not pd.isna(cb_change):
+                    if cb_change <= config.QQQ_CB_THRESHOLD_DOWN:
+                        return "bearish", ratio
+                    if cb_change >= config.QQQ_CB_THRESHOLD_UP:
+                        return "bullish", ratio
+
+        # Layer 2: ローリング比率
+        if ratio > config.QQQ_GRAY_ZONE_HIGH:
+            return "bullish", ratio
+        if ratio < config.QQQ_GRAY_ZONE_LOW:
+            return "bearish", ratio
+        return "gray", ratio
 
     # --- BTC地合いフィルター ---
     btc_bullish_dates = set()
@@ -370,14 +397,13 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
             di_plus = float(adx_result[dmp_col].iloc[i])
             di_minus = float(adx_result[dmn_col].iloc[i])
 
-            prior_r = ratio_series[ratio_series.index <= ts]
-            ratio = float(prior_r.iloc[-1]) if not prior_r.empty else 0.5
+            regime, ratio = _qqq_regime_at(ts)
             rsi_c = float(rsi5.iloc[i]) if not pd.isna(rsi5.iloc[i]) else 0.0
 
             # ===== ロング: ブレイクアウト =====
             entry_side = None
             if price > breakout_level and price > ema20_val:
-                if ratio <= config.QQQ_GRAY_ZONE_HIGH:
+                if regime != "bullish":
                     skipped["long_no_regime"] += 1
                 elif adx_val < config.BREAKOUT_ADX_THRESHOLD or di_plus <= di_minus:
                     skipped["long_no_adx"] += 1
@@ -386,7 +412,7 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
 
             # ===== ショート: ブレイクダウン =====
             if entry_side is None and price < breakdown_level and price < ema20_val:
-                if ratio >= config.QQQ_GRAY_ZONE_LOW:
+                if regime != "bearish":
                     skipped["short_no_regime"] += 1
                 elif adx_val < config.BREAKOUT_ADX_THRESHOLD or di_minus <= di_plus:
                     skipped["short_no_adx"] += 1
@@ -594,6 +620,7 @@ def main():
     parser.add_argument("--start-date", type=str, default=None, help="開始日 YYYY-MM-DD")
     parser.add_argument("--end-date", type=str, default=None, help="終了日 YYYY-MM-DD")
     parser.add_argument("--btc-filter", type=str, default=None, choices=["on", "off"], help="BTC地合いフィルター on/off")
+    parser.add_argument("--legacy-regime", action="store_true", help="QQQレジームをローリング比率のみで判定（CB無効）")
     args = parser.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",")]
@@ -627,7 +654,7 @@ def main():
     ))
     print(f"  BTC地合いフィルター: {btc_label}")
 
-    results = run_backtest(symbols, args.days, start_date=start_date, end_date=end_date, btc_filter_override=btc_override)
+    results = run_backtest(symbols, args.days, start_date=start_date, end_date=end_date, btc_filter_override=btc_override, legacy_regime=args.legacy_regime)
 
     # フィルター統計
     sk = results["skipped"]

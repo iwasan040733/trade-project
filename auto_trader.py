@@ -24,7 +24,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 
 import config
 from models import AutoPosition
-from indicators import calc_qqq_bullish_ratio
+from indicators import calc_qqq_regime_hybrid
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -69,6 +69,8 @@ class AutoTrader:
         # QQQ レジーム
         self._qqq_ratio: float = 0.5
         self._qqq_regime: str | None = None
+        self._qqq_regime_source: str = "rolling"
+        self._qqq_regime_lock_until: datetime | None = None
         self._qqq_cache_time: datetime | None = None
 
         # VIX パニック
@@ -173,20 +175,42 @@ class AutoTrader:
             df = self._fetch_5min_bars("QQQ", hours=4)
             if df is None or df.empty:
                 return
-            ratio_series = calc_qqq_bullish_ratio(df, window=config.QQQ_BULLISH_RATIO_WINDOW)
-            ratio = float(ratio_series.iloc[-1])
+
+            new_regime, source, ratio = calc_qqq_regime_hybrid(
+                df,
+                window=config.QQQ_BULLISH_RATIO_WINDOW,
+                cb_bars=config.QQQ_CB_BARS,
+                cb_threshold_down=config.QQQ_CB_THRESHOLD_DOWN,
+                cb_threshold_up=config.QQQ_CB_THRESHOLD_UP,
+                gray_zone_low=config.QQQ_GRAY_ZONE_LOW,
+                gray_zone_high=config.QQQ_GRAY_ZONE_HIGH,
+            )
             self._qqq_ratio = ratio
 
-            if ratio > config.QQQ_GRAY_ZONE_HIGH:
-                self._qqq_regime = "bullish"
-            elif ratio < config.QQQ_GRAY_ZONE_LOW:
-                self._qqq_regime = "bearish"
+            # レジームロック（チャタリング防止）
+            if (
+                self._qqq_regime is not None
+                and new_regime != self._qqq_regime
+                and self._qqq_regime_lock_until
+                and now < self._qqq_regime_lock_until
+            ):
+                lock_remaining = int((self._qqq_regime_lock_until - now).total_seconds())
+                log.info(
+                    f"[Regime] ロック中({lock_remaining}秒残) "
+                    f"維持={self._qqq_regime} 却下={new_regime}[{source}]"
+                )
             else:
-                self._qqq_regime = "gray"
+                if self._qqq_regime != new_regime:
+                    self._qqq_regime_lock_until = now + timedelta(seconds=config.QQQ_REGIME_LOCK_SECONDS)
+                self._qqq_regime = new_regime
+                self._qqq_regime_source = source
 
             self._qqq_cache_time = now
             price = float(df["close"].astype(float).iloc[-1])
-            log.info(f"[Regime] QQQ=${price:.2f} ratio={ratio:.0%} → {self._qqq_regime}")
+            log.info(
+                f"[Regime] QQQ=${price:.2f} ratio={ratio:.0%} "
+                f"→ {self._qqq_regime} [{self._qqq_regime_source}]"
+            )
         except Exception as e:
             log.warning(f"[Regime] QQQ判定失敗: {e}")
 
@@ -337,28 +361,29 @@ class AutoTrader:
         atr_v = float(atr_series.iloc[-1])
 
         # --- QQQ レジーム ---
+        regime = self._qqq_regime
         ratio = self._qqq_ratio
 
         # ===== ロング: ブレイクアウト =====
         entry_side = None
         if price > breakout_level and price > ema20_val:
-            if ratio > config.QQQ_GRAY_ZONE_HIGH:
+            if regime == "bullish":
                 if adx_val >= config.BREAKOUT_ADX_THRESHOLD and di_plus > di_minus:
                     entry_side = "long"
                 else:
                     log.debug(f"{symbol} ロング ADX不適合 ADX={adx_val:.1f} +DI={di_plus:.1f} -DI={di_minus:.1f}")
             else:
-                log.debug(f"{symbol} ロング QQQ非ブル ratio={ratio:.0%}")
+                log.debug(f"{symbol} ロング QQQ非ブル regime={regime} ratio={ratio:.0%}")
 
         # ===== ショート: ブレイクダウン =====
         if entry_side is None and price < breakdown_level and price < ema20_val:
-            if ratio < config.QQQ_GRAY_ZONE_LOW:
+            if regime == "bearish":
                 if adx_val >= config.BREAKOUT_ADX_THRESHOLD and di_minus > di_plus:
                     entry_side = "short"
                 else:
                     log.debug(f"{symbol} ショート ADX不適合 ADX={adx_val:.1f} +DI={di_plus:.1f} -DI={di_minus:.1f}")
             else:
-                log.debug(f"{symbol} ショート QQQ非ベア ratio={ratio:.0%}")
+                log.debug(f"{symbol} ショート QQQ非ベア regime={regime} ratio={ratio:.0%}")
 
         if entry_side is None:
             return None
@@ -585,7 +610,7 @@ class AutoTrader:
         embed.add_field(name="トレーリング", value=f"ATR×{config.BREAKOUT_TRAILING_ATR_MULT}", inline=True)
         embed.add_field(name="ATR%", value=f"{position.atr_pct:.1f}%", inline=True)
         embed.add_field(name="レベル", value=position.support_name, inline=True)
-        embed.add_field(name="QQQ", value=f"{self._qqq_regime} ({self._qqq_ratio:.0%})", inline=True)
+        embed.add_field(name="QQQ", value=f"{self._qqq_regime} ({self._qqq_ratio:.0%}) [{self._qqq_regime_source}]", inline=True)
         embed.set_footer(text=f"{'🟢 Paper' if config.ALPACA_PAPER else '🔴 Live'} Sniper")
         return embed
 
