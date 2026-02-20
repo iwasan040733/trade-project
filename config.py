@@ -35,7 +35,7 @@ RISK_PER_TRADE = 0.01              # 1トレードのリスク = 資金の 1%（
 MAX_POSITIONS = 3                  # 最大同時ポジション数
 MAX_POSITION_PCT = 0.35            # 1銘柄の最大ポジション比率 35%
 
-POSITION_SIZE = 1000               # バックテスト用（本番は RISK_PER_TRADE で自動計算）
+POSITION_SIZE = 2000               # バックテスト用（3銘柄分散: $2,000 × 3）
 
 # 市場時間（米国東部時間）— この時間外はエントリーしない
 MARKET_OPEN_HOUR = 9
@@ -44,13 +44,17 @@ MARKET_CLOSE_HOUR = 16
 MARKET_CLOSE_MINUTE = 0
 EOD_CLOSE_MINUTES_BEFORE = 30     # 市場クローズ 30 分前に全ポジション決済（15:30 ET）
 
-# 利確 / 損切り
-TAKE_PROFIT_MIN = 0.015            # 利確下限 1.5%
-TAKE_PROFIT_MAX = 0.03             # 利確上限 3.0%
-STOP_LOSS_ATR_MULT = 2.0           # 損切り = 5分足 ATR(14) × 2.0
+# 利確 / 損切り（ATRベース R:R設計）
+STOP_LOSS_ATR_MULT = 1.5           # 損切り = 5分足 ATR(14) × 1.5
 STOP_LOSS_MAX_PCT = 0.02           # 損切り上限 2.0%（キャップ）
-TRAILING_ACTIVATE_PCT = 0.005      # トレーリングストップ発動: +0.5% の含み益
-TRAILING_RETURN_PCT = 0.003        # トレーリングストップ: 最高値から 0.3% 戻りで決済
+TAKE_PROFIT_RR_MULT = 3.0          # 利確 = 損切り幅 × 3.0（R:R = 1:3）
+
+# トレーリングストップ（ATRベース）
+TRAILING_ATR_MULT = 2.0            # トレーリング幅 = ATR(14) × 2.0
+TRAILING_ACTIVATE_ATR_MULT = 1.0   # トレーリング発動: ATR × 1.0 の含み益
+
+# エントリーATRフィルター（低ボラ回避）
+ENTRY_MIN_ATR_PCT = 0.003          # 最低 ATR% = 0.3%（値幅が取れないタイミングを回避）
 
 # スクリーナー（取引開始1時間前に1回だけ実行 → 通知のみ、自動売買には使わない）
 SCREENER_HOUR_ET = 8               # 実行時刻（米国東部時間）8:30 AM
@@ -63,7 +67,6 @@ SCREENER_MIN_VOLUME = 1_000_000    # 最低出来高（直近日足）
 
 # 個人投資家に人気の銘柄（スクリーニングで優先）
 RETAIL_FAVORITES = [
-    "ALAB",   # Astera Labs
     "PLTR",   # Palantir
     "SOFI",   # SoFi Technologies
     "HOOD",   # Robinhood
@@ -88,7 +91,7 @@ RETAIL_FAVORITES = [
 # 注目テーマ株（手動更新 — 旬のテーマごとに銘柄を定義）
 THEME_STOCKS = {
     "メモリ/HDD": ["SNDK", "WDC", "STX", "MU", "NAND"],
-    "AI半導体": ["NVDA", "AMD", "AVGO", "MRVL", "ALAB"],
+    "AI半導体": ["NVDA", "AMD", "AVGO", "MRVL"],
     "量子コンピュータ": ["IONQ", "RGTI", "QBTS"],
 }
 
@@ -102,7 +105,14 @@ AUTO_TRADE_INTERVAL_SECONDS = 30   # 30秒ごとに判定
 AUTO_SYMBOLS_COUNT = 10
 AUTO_SYMBOLS_FETCH_TOP = 50            # MostActives から多めに取得
 AUTO_SYMBOLS_MIN_PRICE = 20.0          # $20以上の銘柄のみ（小型・ペニー株除外）
-AUTO_SYMBOLS_FALLBACK = ["NVDA", "TSLA", "AAPL", "AMD", "META", "MSFT", "GOOGL", "AMZN"]
+AUTO_SYMBOLS_FALLBACK = ["COIN", "MARA", "MSTR", "SOXL", "SMCI"]
+
+# スナイパー型 固定銘柄（自動売買で使用）
+SNIPER_SYMBOLS = ["COIN", "MARA", "MSTR", "SOXL", "SMCI"]
+
+# ショート代替シンボル: ショートシグナル発生時にインバースETFをロング買いで代替エントリー
+# 例: SOXLのショートシグナル → SOXSをロング買い（空売り不要）
+SYMBOL_SHORT_SUBSTITUTE: dict[str, str] = {"SOXL": "SOXS"}
 
 # 決算ブラックアウト（決算発表前後は自動停止）
 EARNINGS_BLACKOUT_HOURS = 24       # 決算前後 24 時間は取引停止
@@ -113,7 +123,40 @@ ENTRY_BUFFER_MINUTES_CLOSE = 30   # 引け前 30 分はエントリーしない�
 
 # エントリー条件
 ENTRY_PROXIMITY_THRESHOLD = 0.005  # サポートまで 0.5% 以内
-ENTRY_RSI_THRESHOLD = 35           # RSI がこの値以下から上昇に転じる
+ENTRY_RSI_THRESHOLD = 30           # RSI がこの値以下から上昇に転じる
+ENTRY_VOLUME_MULT = 1.5            # 出来高フィルター: 直近20本平均の1.5倍以上
+
+# ============================================================
+#  BTC地合いフィルター（Crypto Regime Filter）
+# ============================================================
+BTC_REGIME_ENABLED = False
+BTC_REGIME_SYMBOL = "BITO"            # ProShares Bitcoin Strategy ETF
+BTC_REGIME_SMA_PERIOD = 20            # 日足20SMA: 価格がこの下なら Bearish → ロング禁止
+
+# ============================================================
+#  ボラティリティブレイクアウト（Volatility Breakout）— スナイパー型
+# ============================================================
+BREAKOUT_ENABLED = True
+BREAKOUT_K = 0.5                      # 前日レンジ × K を始値に加算
+BREAKOUT_EMA_PERIOD = 20              # フィルター: 5分足20EMA上のみ
+BREAKOUT_STOP_ATR_MULT = 1.5          # 損切り = ATR(14) × 1.5（ノイズ耐性強化）
+BREAKOUT_TRAILING_ATR_MULT = 5.0      # トレーリング = ATR(14) × 5.0（ホームラン狙い）
+BREAKOUT_TP_ATR_MULT = 0.0            # 固定TP無効（トレーリングのみ）
+BREAKOUT_EOD_MINUTES = 5              # 引け5分前（15:55 ET）に強制決済
+BREAKOUT_MAX_TRADES_PER_DAY = 1       # 1日1回制限（往復ビンタ排除）
+
+# スナイパーフィルター
+BREAKOUT_ADX_PERIOD = 14              # ADX 計算期間
+BREAKOUT_ADX_THRESHOLD = 40           # ADX > 40 で強トレンドのみ（厳選）
+BREAKOUT_VOL_SPIKE_SHORT = 5          # 出来高スパイク: 直近N本の平均
+BREAKOUT_VOL_SPIKE_LONG = 20          # 出来高スパイク: 過去N本の平均
+BREAKOUT_VOL_SPIKE_MULT = 2.0         # 直近5本 / 過去20本 >= 2.0倍（厳選）
+BREAKOUT_ATR_EXPANSION = True         # ATR拡大フィルター: 現在ATR > 1日平均ATR
+
+# プルバックエントリー（指値注文）
+BREAKOUT_PULLBACK_ENABLED = False     # True=プルバック待ち指値, False=成行
+BREAKOUT_PULLBACK_BUFFER_ATR = 0.3    # 指値 = ブレイクアウトライン + ATR×0.3（少し余裕）
+BREAKOUT_PULLBACK_TIMEOUT_BARS = 12   # 12本（5分×12=1時間）以内に約定しなければキャンセル
 
 # ============================================================
 #  急落リバウンド戦略（Crash & Bounce）
@@ -148,24 +191,3 @@ VIX_PANIC_THRESHOLD = 0.10            # VIX 前日比 +10% でパニックモー
 VIX_SYMBOL = "^VIX"                   # yfinance 用シンボル
 VIX_CACHE_SECONDS = 300               # VIX キャッシュ（5分）
 
-# ============================================================
-#  ショート戦略
-# ============================================================
-SHORT_ENABLED = True
-SHORT_RSI_THRESHOLD = 65              # RSI >= 65 から下落で売りエントリー
-SHORT_PROXIMITY_THRESHOLD = 0.005     # レジスタンスまで 0.5% 以内
-SHORT_CONFIRM_PREV_BEARISH = True     # 直前バーも陰線であることを確認
-
-# ============================================================
-#  カナリア戦略（Canary in the Coal Mine）
-# ============================================================
-CANARY_ENABLED = True
-CANARY_RSI_ENTRY_HIGH = 60           # RSI がこの値以上から
-CANARY_RSI_ENTRY_LOW = 50            # この値以下に急落でエントリー
-CANARY_RSI_LOOKBACK = 3              # RSI高値の探索バー数（5分足×3=15分以内）
-CANARY_RSI_FLOOR = 35                # RSI下限（これ以下は売られすぎでスキップ）
-CANARY_MIN_DIVERGENCE = 0.005        # QQQとの最小乖離（0.5pp以上弱い場合のみ）
-CANARY_ENTRY_CUTOFF_MINUTES = 90     # 引け N 分前はカナリアエントリー禁止（14:30 ET）
-CANARY_MAX_POSITIONS = 2             # カナリア同時ポジション上限
-CANARY_TAKE_PROFIT_PCT = 0.01        # 利確 1.0%（確実に拾う）
-CANARY_STOP_LOSS_PCT = 0.005         # 損切り 0.5%（VWAPを再度上抜けor0.5%上昇）

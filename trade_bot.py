@@ -549,84 +549,16 @@ async def graceful_shutdown():
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    log.info(f"AUTO_SYMBOLS_FALLBACK: {config.AUTO_SYMBOLS_FALLBACK}")
-    log.info(f"WATCHLIST: {config.WATCHLIST}")
+    log.info(f"SNIPER_SYMBOLS: {config.SNIPER_SYMBOLS}")
     log.info(f"Channel: {config.DISCORD_CHANNEL_ID}")
     log.info(f"Entry window: 9:{config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN:02d}~"
              f"{config.MARKET_CLOSE_HOUR}:{config.MARKET_CLOSE_MINUTE:02d} "
              f"(- {config.ENTRY_BUFFER_MINUTES_CLOSE}min) ET")
-    log.info(f"Screener: daily at {config.SCREENER_HOUR_ET}:{config.SCREENER_MINUTE_ET:02d} ET (info only)")
     log.info(f"AutoTrade interval: {config.AUTO_TRADE_INTERVAL_SECONDS}s")
-    log.info(f"Account: ${config.ACCOUNT_SIZE} / Risk: {config.RISK_PER_TRADE*100:.0f}% / Max: {config.MAX_POSITIONS}")
+    log.info(f"Account: ${config.ACCOUNT_SIZE} / Position: ${config.POSITION_SIZE} / Max: {config.MAX_POSITIONS}")
     log.info(f"Paper: {config.ALPACA_PAPER}")
 
-    # 起動通知を Discord に送信
-    channel = bot.get_channel(config.DISCORD_CHANNEL_ID)
-    if channel:
-        embed = discord.Embed(
-            title="🚀 Bot 起動",
-            description="自動売買システムが稼働を開始しました",
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(
-            name="AUTO_SYMBOLS (売買代金上位を毎日更新)",
-            value=f"上位{config.AUTO_SYMBOLS_COUNT}銘柄を自動取得\n"
-                  f"FB: {', '.join(config.AUTO_SYMBOLS_FALLBACK)}",
-            inline=False,
-        )
-        embed.add_field(name="WATCHLIST", value=", ".join(config.WATCHLIST), inline=False)
-        embed.add_field(
-            name="リスク管理",
-            value=f"資金${config.ACCOUNT_SIZE:,} / 1トレード{config.RISK_PER_TRADE*100:.0f}%",
-            inline=True,
-        )
-        embed.add_field(name="最大ポジション", value=f"{config.MAX_POSITIONS}銘柄 (各{config.MAX_POSITION_PCT*100:.0f}%)", inline=True)
-        embed.add_field(
-            name="利確 / 損切り",
-            value=f"+{config.TAKE_PROFIT_MIN*100:.1f}%〜{config.TAKE_PROFIT_MAX*100:.1f}% / SL=ATR×{config.STOP_LOSS_ATR_MULT:.0f}",
-            inline=True,
-        )
-        embed.add_field(
-            name="エントリー時間帯",
-            value=f"9:{config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN:02d}"
-                  f"~15:{60 - config.ENTRY_BUFFER_MINUTES_CLOSE:02d} ET",
-            inline=True,
-        )
-        embed.add_field(
-            name="スクリーナー",
-            value=f"毎日 {config.SCREENER_HOUR_ET}:{config.SCREENER_MINUTE_ET:02d} ET (通知のみ)",
-            inline=True,
-        )
-        embed.add_field(
-            name="AutoTrade間隔",
-            value=f"{config.AUTO_TRADE_INTERVAL_SECONDS}秒",
-            inline=True,
-        )
-        # 市場レジーム設定
-        qqq_status = "有効" if config.QQQ_FILTER_ENABLED else "無効"
-        vix_status = f"有効(+{config.VIX_PANIC_THRESHOLD*100:.0f}%)" if config.VIX_PANIC_ENABLED else "無効"
-        short_status = "有効" if config.SHORT_ENABLED else "無効"
-        embed.add_field(
-            name="市場レジーム",
-            value=f"QQQ 5分{config.QQQ_MA_PERIOD}MA={qqq_status} / "
-                  f"VIXパニック={vix_status} / ショート={short_status}",
-            inline=False,
-        )
-
-        # 注目テーマ株一覧
-        if config.THEME_STOCKS:
-            theme_lines = []
-            for theme_name, syms in config.THEME_STOCKS.items():
-                theme_lines.append(f"**{theme_name}**: {', '.join(syms)}")
-            embed.add_field(
-                name="🏷️ 注目テーマ",
-                value="\n".join(theme_lines),
-                inline=False,
-            )
-        embed.set_footer(text=f"{'🟢 Paper' if config.ALPACA_PAPER else '🔴 Live'} Trading")
-        await channel.send(embed=embed)
-
+    # ループ起動を最優先（Discord通知より前に行う）
     # monitor_loop は無効化（買いシグナル通知は停止中）
     # if not monitor_loop.is_running():
     #     monitor_loop.start()
@@ -639,6 +571,61 @@ async def on_ready():
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: asyncio.ensure_future(graceful_shutdown()))
+
+    # 起動通知を Discord に送信（失敗しても取引ループには影響しない）
+    try:
+        channel = bot.get_channel(config.DISCORD_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🚀 Bot 起動",
+                description="自動売買システムが稼働を開始しました",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(
+                name="SNIPER銘柄",
+                value=", ".join(config.SNIPER_SYMBOLS),
+                inline=False,
+            )
+            embed.add_field(
+                name="リスク管理",
+                value=f"資金${config.ACCOUNT_SIZE:,} / 1銘柄${config.POSITION_SIZE:,}",
+                inline=True,
+            )
+            embed.add_field(name="最大ポジション", value=f"{config.MAX_POSITIONS}銘柄", inline=True)
+            embed.add_field(
+                name="損切り / トレーリング",
+                value=f"SL=ATR×{config.BREAKOUT_STOP_ATR_MULT} / Trail=ATR×{config.BREAKOUT_TRAILING_ATR_MULT}",
+                inline=True,
+            )
+            embed.add_field(
+                name="エントリー時間帯",
+                value=f"9:{config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN:02d}"
+                      f"~15:{60 - config.ENTRY_BUFFER_MINUTES_CLOSE:02d} ET",
+                inline=True,
+            )
+            embed.add_field(
+                name="フィルター",
+                value=f"ADX≥{config.BREAKOUT_ADX_THRESHOLD} / VolR≥{config.BREAKOUT_VOL_SPIKE_MULT} / ATR拡大",
+                inline=True,
+            )
+            embed.add_field(
+                name="AutoTrade間隔",
+                value=f"{config.AUTO_TRADE_INTERVAL_SECONDS}秒",
+                inline=True,
+            )
+            # 市場レジーム設定
+            qqq_status = "有効" if config.QQQ_FILTER_ENABLED else "無効"
+            vix_status = f"有効(+{config.VIX_PANIC_THRESHOLD*100:.0f}%)" if config.VIX_PANIC_ENABLED else "無効"
+            embed.add_field(
+                name="市場レジーム",
+                value=f"QQQ bullish/bearish={qqq_status} / VIXパニック={vix_status}",
+                inline=False,
+            )
+            embed.set_footer(text=f"{'🟢 Paper' if config.ALPACA_PAPER else '🔴 Live'} Trading")
+            await channel.send(embed=embed)
+    except Exception as e:
+        log.error(f"起動通知の送信に失敗しました（取引ループは正常稼働中）: {e}")
 
 
 # ----------------------------------------------------------

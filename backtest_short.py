@@ -1,14 +1,13 @@
-"""バックテスト: グレーゾーン + カナリア戦略比較
+"""バックテスト: ブレイクアウト・スナイパー型（ロング＋ショート / TP+トレーリング）
 
-3モード比較:
-  A) ロング（従来 — レジーム制御なし）
-  B) 新戦略: グレーゾーン制御ロング + VWAP条件ショート + カナリア
-  各サブ: B-Long, B-Short(regime), B-Canary を個別集計
+低頻度・厚利のブレイクアウト/ブレイクダウン戦略:
+  ロング: 始値 + 前日レンジ × K 上抜け → ADX>30 +DI>-DI → QQQ bullish
+  ショート: 始値 - 前日レンジ × K 下抜け → ADX>30 -DI>+DI → QQQ bearish
+  共通: Volume Spike + ATR拡大
+  出口: 固定TP ATR×3.0 / SL ATR×1.5 / トレーリング ATR×5.0
 
 使い方:
-    python backtest_short.py
-    python backtest_short.py --days 5
-    python backtest_short.py --symbols NVDA,TSLA,AAPL --days 3
+    python backtest_short.py --symbols COIN,MARA,MSTR --days 365
 """
 
 import argparse
@@ -25,15 +24,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import config
-from indicators import (
-    calc_atr_3day,
-    calc_pivot_points,
-    calc_resistance_levels,
-    calc_psychological_levels,
-    calc_dynamic_take_profit,
-    calc_running_vwap,
-    calc_qqq_bullish_ratio,
-)
+from indicators import calc_qqq_bullish_ratio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -41,26 +32,53 @@ ET = ZoneInfo("America/New_York")
 
 
 # ============================================================
-#  BTPosition
+#  PendingOrder（プルバック待ち指値注文）
+# ============================================================
+@dataclass
+class PendingOrder:
+    symbol: str
+    side: str  # "long" or "short"
+    limit_price: float       # 指値（プルバック目標）
+    signal_time: pd.Timestamp
+    signal_bar_idx: int      # シグナル発生時のバーindex
+    breakout_level: float    # ブレイクアウト/ブレイクダウンライン
+    atr_value: float
+    rsi_at_signal: float
+    adx_at_signal: float
+    vol_ratio: float
+    ema20_val: float
+    level_name: str = ""
+
+    def is_expired(self, current_bar_idx: int) -> bool:
+        return (current_bar_idx - self.signal_bar_idx) > config.BREAKOUT_PULLBACK_TIMEOUT_BARS
+
+    def is_filled(self, bar_high: float, bar_low: float) -> bool:
+        if self.side == "long":
+            return bar_low <= self.limit_price  # 安値が指値以下 → 約定
+        else:
+            return bar_high >= self.limit_price  # 高値が指値以上 → 約定
+
+
+# ============================================================
+#  BTPosition（ロング・ショート / TP+トレーリング）
 # ============================================================
 @dataclass
 class BTPosition:
     symbol: str
-    side: str
-    strategy: str  # "long", "short", "canary"
+    side: str  # "long" or "short"
     entry_price: float
     entry_time: pd.Timestamp
     qty: int
-    take_profit_price: float
     stop_loss_price: float
-    highest_price: float = 0.0
-    lowest_price: float = 0.0
+    take_profit_price: float = 0.0  # 固定TP（全利確）
+    extreme_price: float = 0.0
     trailing_stop_price: float = 0.0
     trailing_activated: bool = False
     level_name: str = ""
-    atr_pct: float = 0.0
+    atr_value: float = 0.0
     rsi_at_entry: float = 0.0
-    vwap_at_entry: float = 0.0  # canary: VWAP上抜けで損切り
+    adx_at_entry: float = 0.0
+    vol_ratio: float = 0.0
 
     closed: bool = False
     close_price: float = 0.0
@@ -69,53 +87,56 @@ class BTPosition:
     pnl: float = 0.0
 
     def update_trailing(self, bar_high: float, bar_low: float) -> None:
+        if self.atr_value <= 0:
+            return
         if self.side == "long":
-            if bar_high > self.highest_price:
-                self.highest_price = bar_high
+            if bar_high > self.extreme_price:
+                self.extreme_price = bar_high
             if not self.trailing_activated:
-                if (bar_high - self.entry_price) / self.entry_price >= config.TRAILING_ACTIVATE_PCT:
+                gain = bar_high - self.entry_price
+                if gain >= self.atr_value * config.TRAILING_ACTIVATE_ATR_MULT:
                     self.trailing_activated = True
             if self.trailing_activated:
-                ns = self.highest_price * (1 - config.TRAILING_RETURN_PCT)
+                ns = self.extreme_price - self.atr_value * config.BREAKOUT_TRAILING_ATR_MULT
                 if ns > self.trailing_stop_price:
                     self.trailing_stop_price = ns
         else:
-            if self.lowest_price <= 0 or bar_low < self.lowest_price:
-                self.lowest_price = bar_low
+            if self.extreme_price == 0 or bar_low < self.extreme_price:
+                self.extreme_price = bar_low
             if not self.trailing_activated:
-                if (self.entry_price - bar_low) / self.entry_price >= config.TRAILING_ACTIVATE_PCT:
+                gain = self.entry_price - bar_low
+                if gain >= self.atr_value * config.TRAILING_ACTIVATE_ATR_MULT:
                     self.trailing_activated = True
             if self.trailing_activated:
-                ns = self.lowest_price * (1 + config.TRAILING_RETURN_PCT)
-                if self.trailing_stop_price <= 0 or ns < self.trailing_stop_price:
+                ns = self.extreme_price + self.atr_value * config.BREAKOUT_TRAILING_ATR_MULT
+                if self.trailing_stop_price == 0 or ns < self.trailing_stop_price:
                     self.trailing_stop_price = ns
 
-    def check_exit(self, bh: float, bl: float, cur_vwap: float = 0.0) -> tuple[str | None, float]:
+    def check_exit(self, bh: float, bl: float) -> tuple[str | None, float]:
         if self.side == "long":
+            # TP（利確）
+            if self.take_profit_price > 0 and bh >= self.take_profit_price:
+                return "take_profit", self.take_profit_price
+            # SL
             if bl <= self.stop_loss_price:
                 return "stop_loss", self.stop_loss_price
-            if bh >= self.take_profit_price:
-                return "take_profit", self.take_profit_price
+            # トレーリング
             if self.trailing_stop_price > 0 and bl <= self.trailing_stop_price:
                 return "trailing_stop", self.trailing_stop_price
         else:
+            if self.take_profit_price > 0 and bl <= self.take_profit_price:
+                return "take_profit", self.take_profit_price
             if bh >= self.stop_loss_price:
                 return "stop_loss", self.stop_loss_price
-            if bl <= self.take_profit_price:
-                return "take_profit", self.take_profit_price
-            # canary: VWAP上抜け
-            if self.strategy == "canary" and cur_vwap > 0:
-                bar_close = (bh + bl) / 2  # 近似
-                if bar_close > cur_vwap:
-                    return "vwap_cross", bar_close
             if self.trailing_stop_price > 0 and bh >= self.trailing_stop_price:
                 return "trailing_stop", self.trailing_stop_price
         return None, 0.0
 
     def calc_pnl(self, exit_price: float) -> float:
-        if self.side == "short":
+        if self.side == "long":
+            return (exit_price - self.entry_price) * self.qty
+        else:
             return (self.entry_price - exit_price) * self.qty
-        return (exit_price - self.entry_price) * self.qty
 
 
 # ============================================================
@@ -130,77 +151,52 @@ def fetch_bars(client, symbol, timeframe, days):
     return df
 
 
-def calc_support_for_date(daily_df, target_date):
-    prev = daily_df[daily_df.index.normalize() < target_date.normalize()]
-    if prev.empty:
-        return {}
-    levels = {}
-    levels.update(calc_pivot_points(prev.iloc[-1]))
-    levels.update(calc_psychological_levels(float(prev.iloc[-1]["close"])))
-    c = prev["close"].astype(float)
-    if len(c) >= 50:
-        levels["sma50"] = round(float(c.rolling(50).mean().iloc[-1]), 4)
-    if len(prev) >= 2:
-        levels["prev2_low"] = round(float(prev.iloc[-2]["low"]), 4)
-    return levels
-
-
-def calc_resistance_for_date(daily_df, target_date, price):
-    prev = daily_df[daily_df.index.normalize() < target_date.normalize()]
-    if prev.empty:
-        return {}
-    levels = {}
-    levels.update(calc_resistance_levels(prev.iloc[-1]))
-    for n, v in calc_psychological_levels(price).items():
-        if v >= price:
-            levels[n] = v
-    c = prev["close"].astype(float)
-    if len(c) >= 50:
-        sv = float(c.rolling(50).mean().iloc[-1])
-        if sv >= price:
-            levels["sma50"] = round(sv, 4)
-    return levels
-
-
 # ============================================================
 #  メインバックテスト
 # ============================================================
-def run_backtest(symbols, days, canary_symbols=None):
+def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_override=None):
     client = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+    btc_enabled = btc_filter_override if btc_filter_override is not None else config.BTC_REGIME_ENABLED
 
-    if canary_symbols is None:
-        canary_symbols = list(config.RETAIL_FAVORITES)
+    main_tf = TimeFrame(5, TimeFrameUnit.Minute)
+    bars_per_day = 78  # 6.5H=390min / 5min
+    log.info(f"タイムフレーム: 5min（1日あたり約{bars_per_day}本）")
 
-    # --- QQQ データ ---
+    # --- QQQ データ（レジーム判定は常に5分足）---
     log.info("QQQ データ取得中...")
     qqq_5min = fetch_bars(client, "QQQ", TimeFrame(5, TimeFrameUnit.Minute), days)
-    qqq_daily = fetch_bars(client, "QQQ", TimeFrame.Day, days + 10)
     log.info(f"QQQ 5分足={len(qqq_5min)}本")
-
-    # QQQ ブリッシュ比率
     ratio_series = calc_qqq_bullish_ratio(qqq_5min, window=config.QQQ_BULLISH_RATIO_WINDOW)
-    qqq_close = qqq_5min["close"].astype(float)
 
-    # QQQ 前日終値（日ごと）
-    qqq_prev_close_map = {}
-    for i in range(1, len(qqq_daily)):
-        d = qqq_daily.index[i].normalize()
-        qqq_prev_close_map[d] = float(qqq_daily["close"].astype(float).iloc[i - 1])
-
-    # QQQ 日中始値（日ごと）
-    qqq_day_open_map = {}
-    qqq_dates = qqq_5min.index.normalize()
-    for d in qqq_dates.unique():
-        day_data = qqq_5min[qqq_dates == d]
-        if not day_data.empty:
-            qqq_day_open_map[d] = float(day_data["open"].astype(float).iloc[0])
-
-    # --- 全銘柄データ取得 ---
-    all_symbols = list(set(symbols) | set(canary_symbols))
-    sym_data = {}
-    for sym in all_symbols:
+    # --- BTC地合いフィルター ---
+    btc_bullish_dates = set()
+    if btc_enabled:
+        log.info(f"BTC地合いフィルター: {config.BTC_REGIME_SYMBOL} 日足取得中...")
         try:
-            d5 = fetch_bars(client, sym, TimeFrame(5, TimeFrameUnit.Minute), days)
+            bito_daily = fetch_bars(client, config.BTC_REGIME_SYMBOL, TimeFrame.Day, days + 50)
+            bito_close = bito_daily["close"].astype(float)
+            bito_sma = bito_close.rolling(config.BTC_REGIME_SMA_PERIOD).mean()
+            bullish_count = 0
+            bearish_count = 0
+            for idx in bito_daily.index:
+                d = idx.normalize()
+                sma_val = bito_sma.loc[idx]
+                close_val = bito_close.loc[idx]
+                if not pd.isna(sma_val) and float(close_val) > float(sma_val):
+                    btc_bullish_dates.add(d)
+                    bullish_count += 1
+                else:
+                    bearish_count += 1
+            log.info(f"  BTC regime: bullish={bullish_count}日 bearish={bearish_count}日")
+        except Exception as e:
+            log.warning(f"  {config.BTC_REGIME_SYMBOL} 取得失敗（フィルター無効化）: {e}")
+            btc_enabled = False
+
+    # --- 銘柄データ取得 ---
+    sym_data = {}
+    for sym in symbols:
+        try:
+            d5 = fetch_bars(client, sym, main_tf, days)
             dd = fetch_bars(client, sym, TimeFrame.Day, days + 200)
             if d5.empty:
                 continue
@@ -209,11 +205,13 @@ def run_backtest(symbols, days, canary_symbols=None):
         except Exception as e:
             log.warning(f"  {sym} 取得失敗: {e}")
 
-    # --- 結果格納 ---
-    trades_a_long = []      # A: 従来ロング
-    trades_b_long = []      # B: グレーゾーン制御ロング
-    trades_b_short = []     # B: レジームショート
-    trades_b_canary = []    # B: カナリア
+    trades = []
+    skipped = {
+        "long_no_regime": 0, "long_no_adx": 0, "long_no_vol": 0, "long_no_atr": 0, "long_passed": 0,
+        "short_no_regime": 0, "short_no_adx": 0, "short_no_vol": 0, "short_no_atr": 0, "short_passed": 0,
+        "long_pullback_filled": 0, "long_pullback_expired": 0,
+        "short_pullback_filled": 0, "short_pullback_expired": 0,
+    }
 
     market_open = dtime(config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
     market_close = dtime(config.MARKET_CLOSE_HOUR, config.MARKET_CLOSE_MINUTE)
@@ -221,9 +219,7 @@ def run_backtest(symbols, days, canary_symbols=None):
         config.MARKET_OPEN_HOUR,
         config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN,
     )
-    eod_min = config.EOD_CLOSE_MINUTES_BEFORE
 
-    # 各銘柄シミュレーション
     for sym in symbols:
         if sym not in sym_data:
             continue
@@ -235,12 +231,16 @@ def run_backtest(symbols, days, canary_symbols=None):
         h5 = df5["high"].astype(float)
         l5 = df5["low"].astype(float)
         o5 = df5["open"].astype(float)
-        rsi5 = ta.rsi(c5, length=14)
+        v5 = df5["volume"].astype(float)
         atr5 = ta.atr(h5, l5, c5, length=14)
-        sma_d50 = dfd["close"].astype(float).rolling(50).mean()
-        vwap5 = calc_running_vwap(df5)
+        rsi5 = ta.rsi(c5, length=14)
+        ema20 = c5.ewm(span=config.BREAKOUT_EMA_PERIOD, adjust=False).mean()
 
-        # 日始値マップ
+        adx_result = ta.adx(h5, l5, c5, length=config.BREAKOUT_ADX_PERIOD)
+        adx_col = f"ADX_{config.BREAKOUT_ADX_PERIOD}"
+        dmp_col = f"DMP_{config.BREAKOUT_ADX_PERIOD}"
+        dmn_col = f"DMN_{config.BREAKOUT_ADX_PERIOD}"
+
         d5_dates = df5.index.normalize()
         day_open = {}
         for d in d5_dates.unique():
@@ -248,358 +248,245 @@ def run_backtest(symbols, days, canary_symbols=None):
             if not dd_data.empty:
                 day_open[d] = float(dd_data["open"].astype(float).iloc[0])
 
-        sup_cache = {}
-        res_cache = {}
+        open_pos = None
+        pending_order = None  # プルバック待ち指値注文
+        daily_trade_count = {}
+        pullback_enabled = config.BREAKOUT_PULLBACK_ENABLED
 
-        open_a = None
-        open_b_long = None
-        open_b_short = None
-
-        for i in range(20, len(df5)):
+        for i in range(max(20, bars_per_day), len(df5)):
             ts = df5.index[i]
             price = float(c5.iloc[i])
             bh = float(h5.iloc[i])
             bl = float(l5.iloc[i])
-            bo = float(o5.iloc[i])
 
             ts_et = ts.astimezone(ET) if ts.tzinfo else ts.tz_localize("UTC").astimezone(ET)
             bt = ts_et.time()
             if bt < market_open or bt >= market_close or ts_et.weekday() >= 5:
                 continue
 
-            eod_t = (datetime.combine(ts_et.date(), market_close, tzinfo=ET) - timedelta(minutes=eod_min)).time()
-
-            # レジーム取得
-            prior_r = ratio_series[ratio_series.index <= ts]
-            ratio = float(prior_r.iloc[-1]) if not prior_r.empty else 0.5
-
-            cur_vwap = float(vwap5.iloc[i]) if not pd.isna(vwap5.iloc[i]) else 0.0
-
-            # グレーゾーン判定
-            in_gray = config.QQQ_GRAY_ZONE_LOW <= ratio <= config.QQQ_GRAY_ZONE_HIGH
-            sl_tighten = config.GRAY_ZONE_SL_TIGHTEN_PCT if in_gray else 0.0
-
-            # レジーム文字列
-            if ratio > config.QQQ_GRAY_ZONE_HIGH:
-                regime = "bullish"
-            elif ratio < config.QQQ_GRAY_ZONE_LOW:
-                regime = "bearish"
-            else:
-                regime = "gray"
-
-            # --- EOD決済 ---
-            if bt >= eod_t:
-                for pos, tlist in [(open_a, trades_a_long), (open_b_long, trades_b_long), (open_b_short, trades_b_short)]:
-                    if pos is not None and not pos.closed:
-                        pos.closed = True
-                        pos.close_price = price
-                        pos.close_time = ts
-                        pos.close_reason = "end_of_day"
-                        pos.pnl = pos.calc_pnl(price)
-                        tlist.append(pos)
-                open_a = open_b_long = open_b_short = None
+            # --- EOD: 指値キャンセル + ポジション決済 (15:55 ET) ---
+            if bt >= dtime(15, 55):
+                if pending_order is not None:
+                    skipped[f"{pending_order.side}_pullback_expired"] += 1
+                    pending_order = None
+                if open_pos is not None and not open_pos.closed:
+                    open_pos.closed = True
+                    open_pos.close_price = price
+                    open_pos.close_time = ts
+                    open_pos.close_reason = "end_of_day"
+                    open_pos.pnl = open_pos.calc_pnl(price)
+                    trades.append(open_pos)
+                    open_pos = None
                 continue
 
             # --- ポジション監視 ---
-            for pos, tlist in [(open_a, trades_a_long), (open_b_long, trades_b_long), (open_b_short, trades_b_short)]:
-                if pos is None or pos.closed:
-                    continue
-                pos.update_trailing(bh, bl)
-                reason, ep = pos.check_exit(bh, bl, cur_vwap)
+            if open_pos is not None and not open_pos.closed:
+                open_pos.update_trailing(bh, bl)
+                reason, ep = open_pos.check_exit(bh, bl)
                 if reason:
-                    pos.closed = True
-                    pos.close_price = ep
-                    pos.close_time = ts
-                    pos.close_reason = reason
-                    pos.pnl = pos.calc_pnl(ep)
-                    tlist.append(pos)
-            if open_a is not None and open_a.closed:
-                open_a = None
-            if open_b_long is not None and open_b_long.closed:
-                open_b_long = None
-            if open_b_short is not None and open_b_short.closed:
-                open_b_short = None
+                    open_pos.closed = True
+                    open_pos.close_price = ep
+                    open_pos.close_time = ts
+                    open_pos.close_reason = reason
+                    open_pos.pnl = open_pos.calc_pnl(ep)
+                    trades.append(open_pos)
+                    open_pos = None
 
-            # --- エントリー ---
+            # --- 指値注文の約定チェック ---
+            if pending_order is not None and open_pos is None:
+                if pending_order.is_expired(i):
+                    skipped[f"{pending_order.side}_pullback_expired"] += 1
+                    pending_order = None
+                elif pending_order.is_filled(bh, bl):
+                    # 約定 → ポジション作成
+                    fill_price = pending_order.limit_price
+                    dk_day = ts_et.strftime("%Y-%m-%d")
+                    daily_trade_count[dk_day] = daily_trade_count.get(dk_day, 0) + 1
+                    qty = max(1, math.floor(config.POSITION_SIZE / fill_price))
+                    sl_dist = pending_order.atr_value * config.BREAKOUT_STOP_ATR_MULT
+                    tp_dist = pending_order.atr_value * config.BREAKOUT_TP_ATR_MULT if config.BREAKOUT_TP_ATR_MULT > 0 else 0
+
+                    if pending_order.side == "long":
+                        sl_price = round(fill_price - sl_dist, 2)
+                        tp_price = round(fill_price + tp_dist, 2) if tp_dist > 0 else 0.0
+                    else:
+                        sl_price = round(fill_price + sl_dist, 2)
+                        tp_price = round(fill_price - tp_dist, 2) if tp_dist > 0 else 0.0
+
+                    bars_waited = i - pending_order.signal_bar_idx
+                    log.info(
+                        f"[{pending_order.side.upper()} FILL] {sym} {ts_et.strftime('%m/%d %H:%M')} "
+                        f"${fill_price:.2f} (待ち{bars_waited}本) ADX={pending_order.adx_at_signal:.1f} "
+                        f"VolR={pending_order.vol_ratio:.2f} ATR=${pending_order.atr_value:.2f}"
+                    )
+
+                    skipped[f"{pending_order.side}_pullback_filled"] += 1
+                    open_pos = BTPosition(
+                        symbol=sym, side=pending_order.side,
+                        entry_price=fill_price, entry_time=ts, qty=qty,
+                        stop_loss_price=sl_price, take_profit_price=tp_price,
+                        extreme_price=fill_price, level_name=pending_order.level_name,
+                        atr_value=pending_order.atr_value,
+                        rsi_at_entry=pending_order.rsi_at_signal,
+                        adx_at_entry=pending_order.adx_at_signal,
+                        vol_ratio=pending_order.vol_ratio,
+                    )
+                    pending_order = None
+
+            # --- エントリー判定（シグナル検出）---
+            if open_pos is not None or pending_order is not None:
+                continue
             if bt < entry_start or bt >= dtime(15, 30):
                 continue
-            if pd.isna(rsi5.iloc[i]) or pd.isna(atr5.iloc[i]):
+            bar_date = ts_et.date()
+            if start_date and bar_date < start_date:
                 continue
-            rsi_c = float(rsi5.iloc[i])
-            rsi_p = float(rsi5.iloc[i - 1]) if not pd.isna(rsi5.iloc[i - 1]) else None
+            if end_date and bar_date > end_date:
+                continue
+            dk_day = ts_et.strftime("%Y-%m-%d")
+            if daily_trade_count.get(dk_day, 0) >= config.BREAKOUT_MAX_TRADES_PER_DAY:
+                continue
+            if pd.isna(atr5.iloc[i]):
+                continue
+
             atr_v = float(atr5.iloc[i])
-            if rsi_p is None:
+            prior_d = dfd[dfd.index.normalize() < ts.normalize()]
+            if prior_d.empty:
                 continue
 
-            dk = ts_et.strftime("%Y-%m-%d")
-            prior_sma = sma_d50[sma_d50.index.normalize() <= ts.normalize()].dropna()
-            above_sma50 = not prior_sma.empty and price > float(prior_sma.iloc[-1])
+            ema20_val = float(ema20.iloc[i]) if not pd.isna(ema20.iloc[i]) else None
+            today_open_price = day_open.get(ts.normalize())
+            if ema20_val is None or today_open_price is None:
+                continue
 
-            prior_d = dfd[dfd.index.normalize() < ts.normalize()]
-            atr_daily = calc_atr_3day(prior_d) if len(prior_d) >= 3 else None
-            tp_pct = calc_dynamic_take_profit(atr_daily, price, config.TAKE_PROFIT_MIN, config.TAKE_PROFIT_MAX) if atr_daily else config.TAKE_PROFIT_MIN
-            max_stop = price * config.STOP_LOSS_MAX_PCT
-            sl_dist = min(atr_v * config.STOP_LOSS_ATR_MULT, max_stop)
-            qty = max(1, math.floor(config.POSITION_SIZE / price))
+            prev_day_bar = prior_d.iloc[-1]
+            prev_range = float(prev_day_bar["high"]) - float(prev_day_bar["low"])
+            breakout_level = today_open_price + prev_range * config.BREAKOUT_K
+            breakdown_level = today_open_price - prev_range * config.BREAKOUT_K
 
-            # === A: 従来ロング ===
-            if open_a is None and above_sma50:
-                if rsi_p <= config.ENTRY_RSI_THRESHOLD and rsi_c > config.ENTRY_RSI_THRESHOLD and price > bo:
-                    if dk not in sup_cache:
-                        sup_cache[dk] = calc_support_for_date(dfd, ts)
-                    nearest = _find_nearest_level(price, sup_cache[dk], config.ENTRY_PROXIMITY_THRESHOLD, "support")
-                    if nearest:
-                        open_a = BTPosition(
-                            symbol=sym, side="long", strategy="long",
-                            entry_price=price, entry_time=ts, qty=qty,
-                            take_profit_price=round(price * (1 + tp_pct), 2),
-                            stop_loss_price=round(price - sl_dist, 2),
-                            highest_price=price, level_name=nearest[0],
-                            atr_pct=round((atr_v / price) * 100, 2), rsi_at_entry=round(rsi_c, 1),
-                        )
+            if adx_result is None or pd.isna(adx_result[adx_col].iloc[i]):
+                continue
+            adx_val = float(adx_result[adx_col].iloc[i])
+            di_plus = float(adx_result[dmp_col].iloc[i])
+            di_minus = float(adx_result[dmn_col].iloc[i])
 
-            # === B: グレーゾーン制御ロング ===
-            if open_b_long is None and regime == "bullish" and above_sma50:
-                if rsi_p <= config.ENTRY_RSI_THRESHOLD and rsi_c > config.ENTRY_RSI_THRESHOLD and price > bo:
-                    if dk not in sup_cache:
-                        sup_cache[dk] = calc_support_for_date(dfd, ts)
-                    nearest = _find_nearest_level(price, sup_cache[dk], config.ENTRY_PROXIMITY_THRESHOLD, "support")
-                    if nearest:
-                        adj_sl = sl_dist * (1 - sl_tighten)
-                        open_b_long = BTPosition(
-                            symbol=sym, side="long", strategy="long",
-                            entry_price=price, entry_time=ts, qty=qty,
-                            take_profit_price=round(price * (1 + tp_pct), 2),
-                            stop_loss_price=round(price - adj_sl, 2),
-                            highest_price=price, level_name=nearest[0],
-                            atr_pct=round((atr_v / price) * 100, 2), rsi_at_entry=round(rsi_c, 1),
-                        )
+            prior_r = ratio_series[ratio_series.index <= ts]
+            ratio = float(prior_r.iloc[-1]) if not prior_r.empty else 0.5
+            rsi_c = float(rsi5.iloc[i]) if not pd.isna(rsi5.iloc[i]) else 0.0
 
-            # === B: レジームショート（bearish、またはgray+VWAP下抜け） ===
-            short_ok = False
-            if regime == "bearish":
-                short_ok = True
-            elif regime == "gray" and config.QQQ_WEAK_BEAR_LOW <= ratio <= config.QQQ_WEAK_BEAR_HIGH:
-                if cur_vwap > 0 and price < cur_vwap:
-                    short_ok = True
+            # ===== ロング: ブレイクアウト =====
+            entry_side = None
+            if price > breakout_level and price > ema20_val:
+                if ratio <= config.QQQ_GRAY_ZONE_HIGH:
+                    skipped["long_no_regime"] += 1
+                elif adx_val < config.BREAKOUT_ADX_THRESHOLD or di_plus <= di_minus:
+                    skipped["long_no_adx"] += 1
+                else:
+                    entry_side = "long"
 
-            if open_b_short is None and short_ok:
-                if rsi_p >= config.SHORT_RSI_THRESHOLD and rsi_c < config.SHORT_RSI_THRESHOLD and price < bo:
-                    # 改善4: 確認バー（直前バーも陰線）
-                    prev_bearish = True
-                    if config.SHORT_CONFIRM_PREV_BEARISH and i >= 2:
-                        prev_o = float(o5.iloc[i - 1])
-                        prev_c = float(c5.iloc[i - 1])
-                        prev_bearish = prev_c < prev_o
-                    if not prev_bearish:
-                        continue
-                    if dk not in res_cache:
-                        res_cache[dk] = calc_resistance_for_date(dfd, ts, price)
-                    nearest = _find_nearest_level(price, res_cache[dk], config.SHORT_PROXIMITY_THRESHOLD, "resistance")
-                    if nearest:
-                        adj_sl = sl_dist * (1 - sl_tighten)
-                        open_b_short = BTPosition(
-                            symbol=sym, side="short", strategy="short",
-                            entry_price=price, entry_time=ts, qty=qty,
-                            take_profit_price=round(price * (1 - tp_pct), 2),
-                            stop_loss_price=round(price + adj_sl, 2),
-                            lowest_price=price, level_name=nearest[0],
-                            atr_pct=round((atr_v / price) * 100, 2), rsi_at_entry=round(rsi_c, 1),
-                        )
+            # ===== ショート: ブレイクダウン =====
+            if entry_side is None and price < breakdown_level and price < ema20_val:
+                if ratio >= config.QQQ_GRAY_ZONE_LOW:
+                    skipped["short_no_regime"] += 1
+                elif adx_val < config.BREAKOUT_ADX_THRESHOLD or di_minus <= di_plus:
+                    skipped["short_no_adx"] += 1
+                else:
+                    entry_side = "short"
+
+            if entry_side is None:
+                continue
+
+            # === 共通フィルター: Volume Spike ===
+            short_window = config.BREAKOUT_VOL_SPIKE_SHORT
+            long_window = config.BREAKOUT_VOL_SPIKE_LONG
+            if i < long_window:
+                skipped[f"{entry_side}_no_vol"] += 1
+                continue
+            vol_short_avg = float(v5.iloc[i - short_window:i].mean())
+            vol_long_avg = float(v5.iloc[i - long_window:i].mean())
+            if vol_long_avg <= 0:
+                skipped[f"{entry_side}_no_vol"] += 1
+                continue
+            vol_ratio = vol_short_avg / vol_long_avg
+            if vol_ratio < config.BREAKOUT_VOL_SPIKE_MULT:
+                skipped[f"{entry_side}_no_vol"] += 1
+                continue
+
+            # === 共通フィルター: ATR拡大 ===
+            if config.BREAKOUT_ATR_EXPANSION:
+                atr_lookback = min(bars_per_day, i)
+                atr_day_avg = float(atr5.iloc[i - atr_lookback:i].dropna().mean()) if atr_lookback > 0 else 0
+                if atr_day_avg > 0 and atr_v <= atr_day_avg:
+                    skipped[f"{entry_side}_no_atr"] += 1
+                    continue
+
+            # === 全フィルター通過 → エントリー or 指値予約 ===
+            skipped[f"{entry_side}_passed"] += 1
+
+            if entry_side == "long":
+                level_label = f"L_bo_{breakout_level:.0f}"
+            else:
+                level_label = f"S_bd_{breakdown_level:.0f}"
+
+            if pullback_enabled:
+                # --- プルバック指値: ブレイクアウトライン + ATR×buffer ---
+                buf = atr_v * config.BREAKOUT_PULLBACK_BUFFER_ATR
+                if entry_side == "long":
+                    limit_price = round(breakout_level + buf, 2)
+                else:
+                    limit_price = round(breakdown_level - buf, 2)
+
+                log.info(
+                    f"[{entry_side.upper()} SIGNAL] {sym} {ts_et.strftime('%m/%d %H:%M')} "
+                    f"${price:.2f} → 指値${limit_price:.2f} ADX={adx_val:.1f} "
+                    f"VolR={vol_ratio:.2f} ATR=${atr_v:.2f} RSI={rsi_c:.0f}"
+                )
+
+                pending_order = PendingOrder(
+                    symbol=sym, side=entry_side, limit_price=limit_price,
+                    signal_time=ts, signal_bar_idx=i,
+                    breakout_level=breakout_level if entry_side == "long" else breakdown_level,
+                    atr_value=atr_v, rsi_at_signal=round(rsi_c, 1),
+                    adx_at_signal=round(adx_val, 1), vol_ratio=round(vol_ratio, 2),
+                    ema20_val=ema20_val, level_name=level_label,
+                )
+            else:
+                # --- 成行エントリー（従来） ---
+                daily_trade_count[dk_day] = daily_trade_count.get(dk_day, 0) + 1
+                qty = max(1, math.floor(config.POSITION_SIZE / price))
+                sl_dist = atr_v * config.BREAKOUT_STOP_ATR_MULT
+                tp_dist = atr_v * config.BREAKOUT_TP_ATR_MULT if config.BREAKOUT_TP_ATR_MULT > 0 else 0
+
+                if entry_side == "long":
+                    sl_price = round(price - sl_dist, 2)
+                    tp_price = round(price + tp_dist, 2) if tp_dist > 0 else 0.0
+                else:
+                    sl_price = round(price + sl_dist, 2)
+                    tp_price = round(price - tp_dist, 2) if tp_dist > 0 else 0.0
+
+                log.info(
+                    f"[{entry_side.upper()}] {sym} {ts_et.strftime('%m/%d %H:%M')} "
+                    f"${price:.2f} ADX={adx_val:.1f} +DI={di_plus:.1f} -DI={di_minus:.1f} "
+                    f"VolRatio={vol_ratio:.2f} ATR=${atr_v:.2f} RSI={rsi_c:.0f}"
+                )
+
+                open_pos = BTPosition(
+                    symbol=sym, side=entry_side, entry_price=price, entry_time=ts, qty=qty,
+                    stop_loss_price=sl_price, take_profit_price=tp_price,
+                    extreme_price=price, level_name=level_label, atr_value=atr_v,
+                    rsi_at_entry=round(rsi_c, 1), adx_at_entry=round(adx_val, 1),
+                    vol_ratio=round(vol_ratio, 2),
+                )
 
         # 未決済
-        if not df5.empty:
+        if open_pos is not None and not open_pos.closed:
             lp = float(c5.iloc[-1])
-            lt = df5.index[-1]
-            for pos, tl in [(open_a, trades_a_long), (open_b_long, trades_b_long), (open_b_short, trades_b_short)]:
-                if pos is not None and not pos.closed:
-                    pos.closed = True
-                    pos.close_price = lp
-                    pos.close_time = lt
-                    pos.close_reason = "backtest_end"
-                    pos.pnl = pos.calc_pnl(lp)
-                    tl.append(pos)
-
-    # --- QQQ VWAP / RSI 事前計算（カナリア警戒モード用） ---
-    qqq_vwap_series = calc_running_vwap(qqq_5min)
-    qqq_rsi_series = ta.rsi(qqq_close, length=14)
-
-    # --- カナリア戦略 ---
-    canary_targets = [s for s in canary_symbols if s in sym_data]
-    # 改善3: カナリアエントリーカットオフ時刻
-    canary_cutoff_t = (
-        datetime.combine(datetime.now().date(), market_close)
-        - timedelta(minutes=config.CANARY_ENTRY_CUTOFF_MINUTES)
-    ).time()
-
-    for sym in canary_targets:
-        df5 = sym_data[sym]["5min"]
-        c5 = df5["close"].astype(float)
-        h5 = df5["high"].astype(float)
-        l5 = df5["low"].astype(float)
-        o5 = df5["open"].astype(float)
-        rsi5 = ta.rsi(c5, length=14)
-        vwap5 = calc_running_vwap(df5)
-        d5_dates = df5.index.normalize()
-
-        day_open = {}
-        for d in d5_dates.unique():
-            dd_data = df5[d5_dates == d]
-            if not dd_data.empty:
-                day_open[d] = float(dd_data["open"].astype(float).iloc[0])
-
-        open_canary = None
-        for i in range(20, len(df5)):
-            ts = df5.index[i]
-            price = float(c5.iloc[i])
-            bh = float(h5.iloc[i])
-            bl = float(l5.iloc[i])
-            ts_et = ts.astimezone(ET) if ts.tzinfo else ts.tz_localize("UTC").astimezone(ET)
-            bt = ts_et.time()
-            if bt < market_open or bt >= market_close or ts_et.weekday() >= 5:
-                continue
-
-            cur_vwap = float(vwap5.iloc[i]) if not pd.isna(vwap5.iloc[i]) else 0.0
-            eod_t = (datetime.combine(ts_et.date(), market_close, tzinfo=ET) - timedelta(minutes=eod_min)).time()
-
-            # EOD
-            if bt >= eod_t and open_canary and not open_canary.closed:
-                open_canary.closed = True
-                open_canary.close_price = price
-                open_canary.close_time = ts
-                open_canary.close_reason = "end_of_day"
-                open_canary.pnl = open_canary.calc_pnl(price)
-                trades_b_canary.append(open_canary)
-                open_canary = None
-                continue
-
-            # 監視
-            if open_canary and not open_canary.closed:
-                open_canary.update_trailing(bh, bl)
-                reason, ep = open_canary.check_exit(bh, bl, cur_vwap)
-                if reason:
-                    open_canary.closed = True
-                    open_canary.close_price = ep
-                    open_canary.close_time = ts
-                    open_canary.close_reason = reason
-                    open_canary.pnl = open_canary.calc_pnl(ep)
-                    trades_b_canary.append(open_canary)
-                    open_canary = None
-
-            # エントリー
-            if bt < entry_start or bt >= dtime(15, 30):
-                continue
-            # 改善3: カナリアエントリーカットオフ（引けN分前は禁止）
-            if bt >= canary_cutoff_t:
-                continue
-            if open_canary is not None:
-                continue
-            # 改善5: カナリア同時ポジション上限（バックテストでは銘柄横断の合計）
-            canary_open_count = sum(1 for t in trades_b_canary if not t.closed)
-            if open_canary is not None:
-                canary_open_count += 1
-            if canary_open_count >= config.CANARY_MAX_POSITIONS:
-                continue
-            if pd.isna(rsi5.iloc[i]):
-                continue
-            rsi_c = float(rsi5.iloc[i])
-            rsi_p = float(rsi5.iloc[i - 1]) if i > 0 and not pd.isna(rsi5.iloc[i - 1]) else None
-            if rsi_p is None:
-                continue
-
-            # QQQ 警戒モード判定（緩和版）
-            prior_qqq = qqq_close[qqq_close.index <= ts]
-            if len(prior_qqq) < 2:
-                continue
-            qqq_cur = float(prior_qqq.iloc[-1])
-            qqq_prev_bar = float(prior_qqq.iloc[-2])
-            qqq_5min_neg = qqq_cur < qqq_prev_bar
-
-            # 条件A: 直近5分マイナス AND QQQが自身のVWAPを0.5%以上下回る
-            cond_a = False
-            prior_qqq_vwap = qqq_vwap_series[qqq_vwap_series.index <= ts]
-            if not prior_qqq_vwap.empty and not pd.isna(prior_qqq_vwap.iloc[-1]):
-                qqq_vwap_val = float(prior_qqq_vwap.iloc[-1])
-                if qqq_vwap_val > 0:
-                    qqq_vwap_dev = (qqq_cur - qqq_vwap_val) / qqq_vwap_val
-                    cond_a = qqq_5min_neg and qqq_vwap_dev <= -0.005
-
-            # 条件B: QQQ RSI(14) < 40
-            cond_b = False
-            prior_qqq_rsi = qqq_rsi_series[qqq_rsi_series.index <= ts]
-            if not prior_qqq_rsi.empty and not pd.isna(prior_qqq_rsi.iloc[-1]):
-                qqq_rsi_val = float(prior_qqq_rsi.iloc[-1])
-                cond_b = qqq_rsi_val < 40
-
-            alert_mode = cond_a or cond_b
-
-            if not alert_mode:
-                continue
-
-            # 条件1: VWAP下抜け
-            if cur_vwap <= 0 or price >= cur_vwap:
-                continue
-
-            # 条件2: 相対的弱さ
-            ts_day = ts.normalize()
-            qqq_open_today = qqq_day_open_map.get(ts_day)
-            stock_open_today = day_open.get(ts_day)
-            if qqq_open_today is None or stock_open_today is None:
-                continue
-            qqq_ret = (qqq_cur - qqq_open_today) / qqq_open_today
-            stock_ret = (price - stock_open_today) / stock_open_today
-            if qqq_ret >= 0 or stock_ret >= qqq_ret:
-                continue
-
-            # 改善1: 最小乖離フィルター（QQQとの乖離が小さすぎる銘柄を除外）
-            divergence = stock_ret - qqq_ret
-            if abs(divergence) < config.CANARY_MIN_DIVERGENCE:
-                continue
-
-            # 条件3: RSI 60→50 急落（直近N本以内にRSI>=60、現在<50）
-            if rsi_c >= config.CANARY_RSI_ENTRY_LOW:
-                continue
-
-            # 改善2: RSI下限ガード（売られすぎの銘柄は反発リスクが高い）
-            if rsi_c < config.CANARY_RSI_FLOOR:
-                continue
-
-            lookback_start = max(0, i - config.CANARY_RSI_LOOKBACK)
-            rsi_window = rsi5.iloc[lookback_start:i].dropna()
-            if rsi_window.empty or float(rsi_window.max()) < config.CANARY_RSI_ENTRY_HIGH:
-                continue
-
-            # カナリア発火ログ（個別銘柄 vs QQQ 乖離）
-            alert_reason = "VWAP-0.5%" if cond_a else "RSI<40"
-            qqq_rsi_at_entry = float(prior_qqq_rsi.iloc[-1]) if not prior_qqq_rsi.empty and not pd.isna(prior_qqq_rsi.iloc[-1]) else 0.0
-            log.info(
-                f"[Canary] {sym} 発火 {ts_et.strftime('%m/%d %H:%M')} "
-                f"alert={alert_reason} | "
-                f"銘柄ret={stock_ret*100:+.2f}% vs QQQ={qqq_ret*100:+.2f}% "
-                f"乖離={divergence*100:+.2f}pp | "
-                f"RSI={rsi_c:.0f} (window_max={float(rsi_window.max()):.0f}) | "
-                f"VWAP=${cur_vwap:.2f} 価格=${price:.2f} | "
-                f"QQQ_RSI={qqq_rsi_at_entry:.1f}"
-            )
-
-            qty = max(1, math.floor(config.POSITION_SIZE / price))
-            open_canary = BTPosition(
-                symbol=sym, side="short", strategy="canary",
-                entry_price=price, entry_time=ts, qty=qty,
-                take_profit_price=round(price * (1 - config.CANARY_TAKE_PROFIT_PCT), 2),
-                stop_loss_price=round(price * (1 + config.CANARY_STOP_LOSS_PCT), 2),
-                lowest_price=price, level_name="canary:vwap",
-                rsi_at_entry=round(rsi_c, 1), vwap_at_entry=round(cur_vwap, 2),
-            )
-
-        if open_canary and not open_canary.closed:
-            lp = float(c5.iloc[-1])
-            open_canary.closed = True
-            open_canary.close_price = lp
-            open_canary.close_time = df5.index[-1]
-            open_canary.close_reason = "backtest_end"
-            open_canary.pnl = open_canary.calc_pnl(lp)
-            trades_b_canary.append(open_canary)
+            open_pos.closed = True
+            open_pos.close_price = lp
+            open_pos.close_time = df5.index[-1]
+            open_pos.close_reason = "backtest_end"
+            open_pos.pnl = open_pos.calc_pnl(lp)
+            trades.append(open_pos)
 
     # レジーム日次集計
     regime_daily = {}
@@ -610,152 +497,156 @@ def run_backtest(symbols, days, canary_symbols=None):
             regime_daily[day] = []
         regime_daily[day].append(float(r))
 
-    return {
-        "a_long": trades_a_long,
-        "b_long": trades_b_long,
-        "b_short": trades_b_short,
-        "b_canary": trades_b_canary,
-        "regime_daily": regime_daily,
-    }
-
-
-def _find_nearest_level(price, levels, threshold, direction):
-    nearest = None
-    nearest_dist = float("inf")
-    for name, level in levels.items():
-        if level <= 0:
-            continue
-        if direction == "support" and level > price * 1.005:
-            continue
-        if direction == "resistance" and level < price * 0.995:
-            continue
-        dist = abs(price - level) / level
-        if dist <= threshold and dist < nearest_dist:
-            nearest_dist = dist
-            nearest = (name, level)
-    return nearest
+    return {"trades": trades, "regime_daily": regime_daily, "skipped": skipped}
 
 
 # ============================================================
 #  結果表示
 # ============================================================
 REASON_JP = {
-    "take_profit": "利確", "stop_loss": "損切り", "trailing_stop": "トレーリング",
-    "vwap_cross": "VWAP上抜け", "end_of_day": "EOD決済", "backtest_end": "BT終了",
+    "stop_loss": "損切り", "trailing_stop": "トレーリング",
+    "take_profit": "利確", "end_of_day": "EOD決済", "backtest_end": "BT終了",
 }
 
 
-def print_trades(trades, label):
-    print(f"\n{'=' * 105}")
-    print(f"  {label}")
-    print(f"{'=' * 105}")
+def print_trades(trades):
+    print(f"\n{'=' * 130}")
+    print(f"  ブレイクアウト・スナイパー（全取引）")
+    print(f"{'=' * 130}")
     if not trades:
         print("  取引なし")
-        print("=" * 105)
+        print("=" * 130)
         return
 
     print(
-        f"{'#':>3} {'銘柄':<5} {'戦略':<7} {'日時':>12} {'Entry':>8} {'Exit':>8} "
-        f"{'PnL':>8} {'%':>6} {'RSI':>5} {'理由':<10} {'レベル':<12}"
+        f"{'#':>3} {'L/S':<4} {'銘柄':<5} {'日時':>12} {'Entry':>8} {'Exit':>8} "
+        f"{'PnL':>9} {'%':>6} {'ADX':>5} {'VolR':>5} {'RSI':>5} {'理由':<10} {'レベル':<14}"
     )
-    print("-" * 105)
+    print("-" * 130)
 
     for idx, t in enumerate(trades, 1):
-        pnl_pct = (t.entry_price - t.close_price) / t.entry_price * 100 if t.side == "short" else (t.close_price - t.entry_price) / t.entry_price * 100
+        if t.side == "long":
+            pnl_pct = (t.close_price - t.entry_price) / t.entry_price * 100
+        else:
+            pnl_pct = (t.entry_price - t.close_price) / t.entry_price * 100
         et = t.entry_time.astimezone(ET) if t.entry_time.tzinfo else t.entry_time
         reason = REASON_JP.get(t.close_reason, t.close_reason)
+        side_label = "L" if t.side == "long" else "S"
         print(
-            f"{idx:>3} {t.symbol:<5} {t.strategy:<7} {et.strftime('%m/%d %H:%M'):>12} "
+            f"{idx:>3} {side_label:<4} {t.symbol:<5} {et.strftime('%m/%d %H:%M'):>12} "
             f"${t.entry_price:>7.2f} ${t.close_price:>7.2f} "
-            f"${t.pnl:>+7.2f} {pnl_pct:>+5.1f}% "
-            f"{t.rsi_at_entry:>4.1f} {reason:<10} {t.level_name:<12}"
+            f"${t.pnl:>+8.2f} {pnl_pct:>+5.1f}% "
+            f"{t.adx_at_entry:>4.1f} {t.vol_ratio:>4.2f} "
+            f"{t.rsi_at_entry:>4.1f} {reason:<10} {t.level_name:<14}"
         )
 
-    total = sum(t.pnl for t in trades)
-    wins = [t for t in trades if t.pnl >= 0]
-    losses = [t for t in trades if t.pnl < 0]
-    wr = len(wins) / len(trades) * 100 if trades else 0
-    aw = sum(t.pnl for t in wins) / len(wins) if wins else 0
-    al = sum(t.pnl for t in losses) / len(losses) if losses else 0
-    pf = abs(sum(t.pnl for t in wins) / sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else float("inf")
+    # --- サイド別サマリー ---
+    for side_label, side_name in [("long", "ロング"), ("short", "ショート"), (None, "合計")]:
+        if side_label:
+            st = [t for t in trades if t.side == side_label]
+        else:
+            st = trades
+        if not st:
+            continue
 
-    rc = {}
-    for t in trades:
-        r = REASON_JP.get(t.close_reason, t.close_reason)
-        rc[r] = rc.get(r, 0) + 1
+        total = sum(t.pnl for t in st)
+        wins = [t for t in st if t.pnl >= 0]
+        losses = [t for t in st if t.pnl < 0]
+        n = len(st)
+        wr = len(wins) / n * 100 if n else 0
+        aw = sum(t.pnl for t in wins) / len(wins) if wins else 0
+        al = sum(t.pnl for t in losses) / len(losses) if losses else 0
+        pf = abs(sum(t.pnl for t in wins) / sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else float("inf")
+        rr = abs(aw / al) if al != 0 else float("inf")
+        avg_pnl = total / n if n else 0
 
+        # 決済理由の内訳
+        rc = {}
+        for t in st:
+            r = REASON_JP.get(t.close_reason, t.close_reason)
+            rc[r] = rc.get(r, 0) + 1
+
+        print(f"\n  --- {side_name} ---")
+        print(f"  取引数: {n}  勝ち/負け: {len(wins)}/{len(losses)}  勝率: {wr:.1f}%")
+        print(f"  総損益: ${total:+.2f}  平均利益: ${aw:+.2f}  平均損失: ${al:+.2f}  PF: {pf:.2f}  R:R: 1:{rr:.2f}")
+        print(f"  ★ 平均利益/取引: ${avg_pnl:+.2f}  決済: {rc}")
+
+    # 日別損益
     daily_pnl = {}
     for t in trades:
         et = t.entry_time.astimezone(ET) if t.entry_time.tzinfo else t.entry_time
         d = et.strftime("%m/%d")
         daily_pnl[d] = daily_pnl.get(d, 0) + t.pnl
 
-    print(f"\n{'-' * 105}")
-    print(f"  総取引数: {len(trades)}  勝ち/負け: {len(wins)}/{len(losses)}  勝率: {wr:.1f}%")
-    print(f"  総損益: ${total:+.2f}  平均利益: ${aw:+.2f}  平均損失: ${al:+.2f}  PF: {pf:.2f}")
-    print(f"  決済理由: {rc}")
     if daily_pnl:
-        print("  日別損益:")
+        print("\n  日別損益:")
         for d, p in sorted(daily_pnl.items()):
-            n = max(1, int(abs(p) / 2))
-            bar = "\033[32m" + "█" * min(n, 40) + "\033[0m" if p >= 0 else "\033[31m" + "█" * min(n, 40) + "\033[0m"
+            n_bar = max(1, int(abs(p) / 2))
+            bar = "\033[32m" + "█" * min(n_bar, 40) + "\033[0m" if p >= 0 else "\033[31m" + "█" * min(n_bar, 40) + "\033[0m"
             print(f"    {d}: ${p:>+8.2f}  {bar}")
-    print("=" * 105)
+    print("=" * 130)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="グレーゾーン + カナリア戦略 バックテスト")
-    parser.add_argument("--symbols", default="NVDA,TSLA,AAPL,MSFT,AMD,META,GOOGL,AMZN")
-    parser.add_argument("--days", type=int, default=10)
+    parser = argparse.ArgumentParser(description="ブレイクアウト・スナイパー バックテスト")
+    parser.add_argument("--symbols", default="COIN")
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--start-date", type=str, default=None, help="開始日 YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, default=None, help="終了日 YYYY-MM-DD")
+    parser.add_argument("--btc-filter", type=str, default=None, choices=["on", "off"], help="BTC地合いフィルター on/off")
     args = parser.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",")]
-    # カナリア対象: symbols + RETAIL_FAVORITES の和集合
-    canary_syms = list(set(symbols) | set(config.RETAIL_FAVORITES[:10]))
 
-    print(f"\n  バックテスト: グレーゾーン + カナリア戦略")
-    print(f"  銘柄: {', '.join(symbols)}")
-    print(f"  カナリア対象: {', '.join(canary_syms[:10])}{'...' if len(canary_syms)>10 else ''}")
-    print(f"  期間: 直近{args.days}日")
-    print(f"  グレーゾーン: {config.QQQ_GRAY_ZONE_LOW*100:.0f}%〜{config.QQQ_GRAY_ZONE_HIGH*100:.0f}% (SL-{config.GRAY_ZONE_SL_TIGHTEN_PCT*100:.0f}%)")
-    print(f"  VWAP条件ショート: QQQ {config.QQQ_WEAK_BEAR_LOW*100:.0f}%〜{config.QQQ_WEAK_BEAR_HIGH*100:.0f}% + VWAP下抜け")
-    print(f"  カナリア: RSI {config.CANARY_RSI_ENTRY_HIGH}→{config.CANARY_RSI_ENTRY_LOW} TP={config.CANARY_TAKE_PROFIT_PCT*100}% SL={config.CANARY_STOP_LOSS_PCT*100}%")
+    from datetime import date as date_type
+    start_date = date_type.fromisoformat(args.start_date) if args.start_date else None
+    end_date = date_type.fromisoformat(args.end_date) if args.end_date else None
+    btc_override = None
+    if args.btc_filter == "on":
+        btc_override = True
+    elif args.btc_filter == "off":
+        btc_override = False
 
-    results = run_backtest(symbols, args.days, canary_syms)
+    btc_label = "ON" if (btc_override if btc_override is not None else config.BTC_REGIME_ENABLED) else "OFF"
+    period_label = f"{args.start_date or '(全期間)'} ~ {args.end_date or '(全期間)'}"
 
-    # レジーム表示
-    print(f"\n{'=' * 105}")
-    print("  QQQ ブリッシュ比率（日別平均）")
-    print(f"{'=' * 105}")
-    for day, ratios in sorted(results["regime_daily"].items()):
-        avg = sum(ratios) / len(ratios) if ratios else 0
-        label = "BULLISH" if avg > config.QQQ_GRAY_ZONE_HIGH else ("BEARISH" if avg < config.QQQ_GRAY_ZONE_LOW else "GRAY")
-        bar_len = int(avg * 40)
-        print(f"    {day}: avg={avg:.0%} [{label:>7}] {'█' * bar_len}{'░' * (40 - bar_len)}")
+    print(f"\n  ブレイクアウト・スナイパー バックテスト（TP+トレーリング）")
+    print(f"  銘柄: {', '.join(symbols)}  タイムフレーム: 5min")
+    print(f"  データ: 直近{args.days}日  エントリー期間: {period_label}")
+    print(f"  ロング: 始値+前日レンジ×{config.BREAKOUT_K} 上抜け + EMA{config.BREAKOUT_EMA_PERIOD}上")
+    print(f"  ショート: 始値-前日レンジ×{config.BREAKOUT_K} 下抜け + EMA{config.BREAKOUT_EMA_PERIOD}下")
+    print(f"  ADXフィルター: ADX>{config.BREAKOUT_ADX_THRESHOLD} (期間{config.BREAKOUT_ADX_PERIOD})")
+    print(f"  出来高スパイク: 直近{config.BREAKOUT_VOL_SPIKE_SHORT}本/{config.BREAKOUT_VOL_SPIKE_LONG}本 >= {config.BREAKOUT_VOL_SPIKE_MULT}x")
+    print(f"  ATR拡大: {config.BREAKOUT_ATR_EXPANSION}")
+    print(f"  SL=ATR×{config.BREAKOUT_STOP_ATR_MULT}  TP=ATR×{config.BREAKOUT_TP_ATR_MULT}  トレーリング=ATR×{config.BREAKOUT_TRAILING_ATR_MULT}  EOD=15:55")
+    print(f"  R:R設計 = 1:{config.BREAKOUT_TP_ATR_MULT/config.BREAKOUT_STOP_ATR_MULT:.1f} （SL{config.BREAKOUT_STOP_ATR_MULT}:TP{config.BREAKOUT_TP_ATR_MULT}）")
+    pullback_label = "ON" if config.BREAKOUT_PULLBACK_ENABLED else "OFF"
+    print(f"  プルバック指値: {pullback_label}" + (
+        f"（バッファ=ATR×{config.BREAKOUT_PULLBACK_BUFFER_ATR}, タイムアウト={config.BREAKOUT_PULLBACK_TIMEOUT_BARS}本）"
+        if config.BREAKOUT_PULLBACK_ENABLED else ""
+    ))
+    print(f"  BTC地合いフィルター: {btc_label}")
 
-    print_trades(results["a_long"], "[A] ロング（従来 — レジーム制御なし）")
-    print_trades(results["b_long"], "[B-Long] ロング（bullish時のみ + グレーゾーンSL縮小）")
-    print_trades(results["b_short"], "[B-Short] ショート（bearish / gray+VWAP下抜け）")
-    print_trades(results["b_canary"], "[B-Canary] カナリア戦略（警戒モード + 高ベータ銘柄）")
+    results = run_backtest(symbols, args.days, start_date=start_date, end_date=end_date, btc_filter_override=btc_override)
 
-    # 統合サマリー
-    b_all = results["b_long"] + results["b_short"] + results["b_canary"]
+    # フィルター統計
+    sk = results["skipped"]
+    long_total = sk["long_no_regime"] + sk["long_no_adx"] + sk["long_no_vol"] + sk["long_no_atr"] + sk["long_passed"]
+    short_total = sk["short_no_regime"] + sk["short_no_adx"] + sk["short_no_vol"] + sk["short_no_atr"] + sk["short_passed"]
 
-    print(f"\n{'=' * 105}")
-    print("  戦略比較サマリー")
-    print(f"{'=' * 105}")
-    for label, trades in [
-        ("A: ロング（従来）", results["a_long"]),
-        ("B-Long: グレーゾーン制御ロング", results["b_long"]),
-        ("B-Short: レジームショート", results["b_short"]),
-        ("B-Canary: カナリア", results["b_canary"]),
-        ("B合計: 新戦略全体", b_all),
-    ]:
-        n = len(trades)
-        pnl = sum(t.pnl for t in trades)
-        wr = len([t for t in trades if t.pnl >= 0]) / n * 100 if n else 0
-        print(f"  {label:40s}  取引={n:>3}  PnL=${pnl:>+8.2f}  勝率={wr:>5.1f}%")
-    print(f"{'=' * 105}")
+    print(f"\n  フィルター統計:")
+    if long_total > 0:
+        print(f"  【ロング候補】 計{long_total}")
+        print(f"    QQQ非ブル:  {sk['long_no_regime']:>5}  ADX不適合: {sk['long_no_adx']:>5}  出来高不足: {sk['long_no_vol']:>5}  ATR縮小: {sk['long_no_atr']:>5}  → シグナル: {sk['long_passed']:>5}")
+    if short_total > 0:
+        print(f"  【ショート候補】 計{short_total}")
+        print(f"    QQQ非ベア:  {sk['short_no_regime']:>5}  ADX不適合: {sk['short_no_adx']:>5}  出来高不足: {sk['short_no_vol']:>5}  ATR縮小: {sk['short_no_atr']:>5}  → シグナル: {sk['short_passed']:>5}")
+    if config.BREAKOUT_PULLBACK_ENABLED:
+        print(f"  【プルバック指値】")
+        print(f"    ロング:  約定{sk['long_pullback_filled']:>3} / 期限切れ{sk['long_pullback_expired']:>3}")
+        print(f"    ショート: 約定{sk['short_pullback_filled']:>3} / 期限切れ{sk['short_pullback_expired']:>3}")
+
+    print_trades(results["trades"])
 
 
 if __name__ == "__main__":
