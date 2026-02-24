@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pandas_ta as ta
+import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -142,6 +143,35 @@ class BTPosition:
 # ============================================================
 #  データ取得
 # ============================================================
+def fetch_vix_daily(days: int) -> dict:
+    """yfinance で ^VIX 日足を取得し、{trading_date: prev_day_vix_close} を返す。
+    取得失敗時は空 dict を返す（フィルター無効化）。
+    """
+    try:
+        start = (datetime.now() - timedelta(days=days + 15)).strftime("%Y-%m-%d")
+        df = yf.download("^VIX", start=start, interval="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            log.warning("VIX データが空です（フィルター無効化）")
+            return {}
+        # MultiIndex 対応
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df[("Close", "^VIX")]
+        else:
+            close = df["Close"]
+        close = close.dropna()
+        # {当日日付: 前日VIX終値} のマップを作成
+        vix_map: dict = {}
+        dates = list(close.index)
+        for i in range(1, len(dates)):
+            current_date = dates[i].date() if hasattr(dates[i], "date") else dates[i]
+            vix_map[current_date] = float(close.iloc[i - 1])
+        log.info(f"VIX データ取得完了: {len(vix_map)} 日分")
+        return vix_map
+    except Exception as e:
+        log.warning(f"VIX データ取得失敗（フィルター無効化）: {e}")
+        return {}
+
+
 def fetch_bars(client, symbol, timeframe, days):
     start = datetime.now(timezone.utc) - timedelta(days=days + 5)
     req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start)
@@ -154,9 +184,10 @@ def fetch_bars(client, symbol, timeframe, days):
 # ============================================================
 #  メインバックテスト
 # ============================================================
-def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_override=None, legacy_regime=False):
+def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_override=None, legacy_regime=False, vix_filter_override=None):
     client = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
     btc_enabled = btc_filter_override if btc_filter_override is not None else config.BTC_REGIME_ENABLED
+    vix_filter_enabled = vix_filter_override if vix_filter_override is not None else config.VIX_FILTER_ENABLED
 
     main_tf = TimeFrame(5, TimeFrameUnit.Minute)
     bars_per_day = 78  # 6.5H=390min / 5min
@@ -194,6 +225,15 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
         if ratio < config.QQQ_GRAY_ZONE_LOW:
             return "bearish", ratio
         return "gray", ratio
+
+    # --- VIXフィルター: 前日VIX終値マップ取得 ---
+    vix_prev_map: dict = {}
+    if vix_filter_enabled:
+        log.info(f"VIXフィルター: 閾値 < {config.VIX_FILTER_THRESHOLD}（前日VIX が低い日はスキップ）")
+        vix_prev_map = fetch_vix_daily(days)
+        if not vix_prev_map:
+            log.warning("  → VIX 取得失敗のため VIX フィルターを無効化します")
+            vix_filter_enabled = False
 
     # --- BTC地合いフィルター ---
     btc_bullish_dates = set()
@@ -234,8 +274,10 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
 
     trades = []
     skipped = {
-        "long_no_regime": 0, "long_no_adx": 0, "long_no_vol": 0, "long_no_atr": 0, "long_passed": 0,
-        "short_no_regime": 0, "short_no_adx": 0, "short_no_vol": 0, "short_no_atr": 0, "short_passed": 0,
+        "long_no_regime": 0, "long_no_adx": 0, "long_no_vol": 0, "long_no_atr": 0,
+        "long_vix_filter": 0, "long_daily_limit": 0, "long_passed": 0,
+        "short_no_regime": 0, "short_no_adx": 0, "short_no_vol": 0, "short_no_atr": 0,
+        "short_vix_filter": 0, "short_daily_limit": 0, "short_passed": 0,
         "long_pullback_filled": 0, "long_pullback_expired": 0,
         "short_pullback_filled": 0, "short_pullback_expired": 0,
     }
@@ -277,7 +319,7 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
 
         open_pos = None
         pending_order = None  # プルバック待ち指値注文
-        daily_trade_count = {}
+        daily_side_done: dict[str, set] = {}  # {date: {"long", "short"}}
         pullback_enabled = config.BREAKOUT_PULLBACK_ENABLED
 
         for i in range(max(20, bars_per_day), len(df5)):
@@ -328,7 +370,7 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
                     # 約定 → ポジション作成
                     fill_price = pending_order.limit_price
                     dk_day = ts_et.strftime("%Y-%m-%d")
-                    daily_trade_count[dk_day] = daily_trade_count.get(dk_day, 0) + 1
+                    daily_side_done.setdefault(dk_day, set()).add(pending_order.side)
                     qty = max(1, math.floor(config.POSITION_SIZE / fill_price))
                     sl_dist = pending_order.atr_value * config.BREAKOUT_STOP_ATR_MULT
                     tp_dist = pending_order.atr_value * config.BREAKOUT_TP_ATR_MULT if config.BREAKOUT_TP_ATR_MULT > 0 else 0
@@ -371,7 +413,8 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
             if end_date and bar_date > end_date:
                 continue
             dk_day = ts_et.strftime("%Y-%m-%d")
-            if daily_trade_count.get(dk_day, 0) >= config.BREAKOUT_MAX_TRADES_PER_DAY:
+            # 両方向とも済みなら早期スキップ
+            if daily_side_done.get(dk_day, set()) >= {"long", "short"}:
                 continue
             if pd.isna(atr5.iloc[i]):
                 continue
@@ -421,6 +464,18 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
 
             if entry_side is None:
                 continue
+
+            # 同方向の1日1回制限
+            if entry_side in daily_side_done.get(dk_day, set()):
+                skipped[f"{entry_side}_daily_limit"] += 1
+                continue
+
+            # === VIXフィルター: マクロ連動銘柄 × 前日VIX < 閾値 → 閑散相場としてスキップ ===
+            if vix_filter_enabled and sym in config.VIX_FILTER_SYMBOLS and vix_prev_map:
+                vix_val = vix_prev_map.get(bar_date)
+                if vix_val is not None and vix_val < config.VIX_FILTER_THRESHOLD:
+                    skipped[f"{entry_side}_vix_filter"] += 1
+                    continue
 
             # === 共通フィルター: Volume Spike ===
             short_window = config.BREAKOUT_VOL_SPIKE_SHORT
@@ -478,7 +533,7 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
                 )
             else:
                 # --- 成行エントリー（従来） ---
-                daily_trade_count[dk_day] = daily_trade_count.get(dk_day, 0) + 1
+                daily_side_done.setdefault(dk_day, set()).add(entry_side)
                 qty = max(1, math.floor(config.POSITION_SIZE / price))
                 sl_dist = atr_v * config.BREAKOUT_STOP_ATR_MULT
                 tp_dist = atr_v * config.BREAKOUT_TP_ATR_MULT if config.BREAKOUT_TP_ATR_MULT > 0 else 0
@@ -523,7 +578,13 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
             regime_daily[day] = []
         regime_daily[day].append(float(r))
 
-    return {"trades": trades, "regime_daily": regime_daily, "skipped": skipped}
+    return {
+        "trades": trades,
+        "regime_daily": regime_daily,
+        "skipped": skipped,
+        "vix_filter_enabled": vix_filter_enabled,
+        "vix_prev_map": vix_prev_map,
+    }
 
 
 # ============================================================
@@ -620,6 +681,7 @@ def main():
     parser.add_argument("--start-date", type=str, default=None, help="開始日 YYYY-MM-DD")
     parser.add_argument("--end-date", type=str, default=None, help="終了日 YYYY-MM-DD")
     parser.add_argument("--btc-filter", type=str, default=None, choices=["on", "off"], help="BTC地合いフィルター on/off")
+    parser.add_argument("--vix-filter", type=str, default=None, choices=["on", "off"], help="VIXフィルター on/off（前日VIX<閾値でスキップ）")
     parser.add_argument("--legacy-regime", action="store_true", help="QQQレジームをローリング比率のみで判定（CB無効）")
     args = parser.parse_args()
 
@@ -634,7 +696,14 @@ def main():
     elif args.btc_filter == "off":
         btc_override = False
 
+    vix_override = None
+    if args.vix_filter == "on":
+        vix_override = True
+    elif args.vix_filter == "off":
+        vix_override = False
+
     btc_label = "ON" if (btc_override if btc_override is not None else config.BTC_REGIME_ENABLED) else "OFF"
+    vix_label = "ON" if (vix_override if vix_override is not None else config.VIX_FILTER_ENABLED) else "OFF"
     period_label = f"{args.start_date or '(全期間)'} ~ {args.end_date or '(全期間)'}"
 
     print(f"\n  ブレイクアウト・スナイパー バックテスト（TP+トレーリング）")
@@ -653,21 +722,28 @@ def main():
         if config.BREAKOUT_PULLBACK_ENABLED else ""
     ))
     print(f"  BTC地合いフィルター: {btc_label}")
+    print(f"  VIXフィルター: {vix_label}" + (
+        f"（前日VIX < {config.VIX_FILTER_THRESHOLD} の日はスキップ）"
+        if (vix_override if vix_override is not None else config.VIX_FILTER_ENABLED) else ""
+    ))
 
-    results = run_backtest(symbols, args.days, start_date=start_date, end_date=end_date, btc_filter_override=btc_override, legacy_regime=args.legacy_regime)
+    results = run_backtest(symbols, args.days, start_date=start_date, end_date=end_date, btc_filter_override=btc_override, legacy_regime=args.legacy_regime, vix_filter_override=vix_override)
 
     # フィルター統計
     sk = results["skipped"]
-    long_total = sk["long_no_regime"] + sk["long_no_adx"] + sk["long_no_vol"] + sk["long_no_atr"] + sk["long_passed"]
-    short_total = sk["short_no_regime"] + sk["short_no_adx"] + sk["short_no_vol"] + sk["short_no_atr"] + sk["short_passed"]
+    vix_active = results.get("vix_filter_enabled", False)
+    long_total = sk["long_no_regime"] + sk["long_no_adx"] + sk["long_no_vol"] + sk["long_no_atr"] + sk["long_vix_filter"] + sk["long_passed"]
+    short_total = sk["short_no_regime"] + sk["short_no_adx"] + sk["short_no_vol"] + sk["short_no_atr"] + sk["short_vix_filter"] + sk["short_passed"]
 
     print(f"\n  フィルター統計:")
     if long_total > 0:
         print(f"  【ロング候補】 計{long_total}")
-        print(f"    QQQ非ブル:  {sk['long_no_regime']:>5}  ADX不適合: {sk['long_no_adx']:>5}  出来高不足: {sk['long_no_vol']:>5}  ATR縮小: {sk['long_no_atr']:>5}  → シグナル: {sk['long_passed']:>5}")
+        vix_str = f"  VIXスキップ: {sk['long_vix_filter']:>5}" if vix_active else ""
+        print(f"    QQQ非ブル:  {sk['long_no_regime']:>5}  ADX不適合: {sk['long_no_adx']:>5}  出来高不足: {sk['long_no_vol']:>5}  ATR縮小: {sk['long_no_atr']:>5}{vix_str}  → シグナル: {sk['long_passed']:>5}")
     if short_total > 0:
         print(f"  【ショート候補】 計{short_total}")
-        print(f"    QQQ非ベア:  {sk['short_no_regime']:>5}  ADX不適合: {sk['short_no_adx']:>5}  出来高不足: {sk['short_no_vol']:>5}  ATR縮小: {sk['short_no_atr']:>5}  → シグナル: {sk['short_passed']:>5}")
+        vix_str = f"  VIXスキップ: {sk['short_vix_filter']:>5}" if vix_active else ""
+        print(f"    QQQ非ベア:  {sk['short_no_regime']:>5}  ADX不適合: {sk['short_no_adx']:>5}  出来高不足: {sk['short_no_vol']:>5}  ATR縮小: {sk['short_no_atr']:>5}{vix_str}  → シグナル: {sk['short_passed']:>5}")
     if config.BREAKOUT_PULLBACK_ENABLED:
         print(f"  【プルバック指値】")
         print(f"    ロング:  約定{sk['long_pullback_filled']:>3} / 期限切れ{sk['long_pullback_expired']:>3}")

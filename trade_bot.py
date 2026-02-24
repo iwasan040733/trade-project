@@ -23,6 +23,7 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import discord
+from discord import app_commands
 from discord.ext import tasks
 import pandas as pd
 
@@ -94,6 +95,7 @@ auto_trader = AutoTrader(data_client, trading_client)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 
 # ----------------------------------------------------------
@@ -500,10 +502,55 @@ async def before_auto_trade():
 
 
 # ----------------------------------------------------------
+#  自動シャットダウンループ（毎日 16:05 ET）
+# ----------------------------------------------------------
+@tasks.loop(time=dtime(hour=16, minute=5, tzinfo=ET))
+async def auto_shutdown_loop():
+    """市場終了後の自動シャットダウン (16:05 ET)。"""
+    log.info("[AutoShutdown] 16:05 ET — 自動シャットダウン開始")
+    await graceful_shutdown()
+
+
+@auto_shutdown_loop.before_loop
+async def before_auto_shutdown():
+    await bot.wait_until_ready()
+    log.info("AutoShutdown loop started (daily at 16:05 ET).")
+
+
+# ----------------------------------------------------------
+#  スラッシュコマンド
+# ----------------------------------------------------------
+@tree.command(name="long_disable", description="本日のロングエントリーを無効化（Bot再起動で自動解除）")
+async def cmd_long_disable(interaction: discord.Interaction):
+    auto_trader.long_disabled = True
+    log.info("[Command] ロング無効化モード ON")
+    embed = discord.Embed(
+        title="🚫 ロングエントリー無効化",
+        description="本日のロングエントリーを停止しました。\nショートエントリーは引き続き有効です。\n解除するには `/long_enable` を使用してください。",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="long_enable", description="ロングエントリーを再有効化")
+async def cmd_long_enable(interaction: discord.Interaction):
+    auto_trader.long_disabled = False
+    log.info("[Command] ロング無効化モード OFF")
+    embed = discord.Embed(
+        title="✅ ロングエントリー再有効化",
+        description="ロングエントリーを再開しました。",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# ----------------------------------------------------------
 #  グレースフルシャットダウン
 # ----------------------------------------------------------
 async def graceful_shutdown():
-    """シグナル受信時: 全決済 → サマリー送信 → 停止通知 → Bot終了。"""
+    """シグナル受信時 / 自動終了時: 全決済 → サマリー送信 → 停止通知 → Bot終了。"""
     log.info("[Shutdown] グレースフルシャットダウン開始...")
 
     # ループを停止
@@ -511,6 +558,8 @@ async def graceful_shutdown():
         monitor_loop.cancel()
     screener_loop.cancel()
     auto_trade_loop.cancel()
+    if auto_shutdown_loop.is_running():
+        auto_shutdown_loop.cancel()
 
     channel = bot.get_channel(config.DISCORD_CHANNEL_ID)
 
@@ -566,6 +615,25 @@ async def on_ready():
         screener_loop.start()
     if not auto_trade_loop.is_running():
         auto_trade_loop.start()
+    if not auto_shutdown_loop.is_running():
+        auto_shutdown_loop.start()
+
+    # 再起動時: Alpaca の既存ポジションを復元
+    restored = auto_trader.restore_positions()
+    if restored:
+        channel = bot.get_channel(config.DISCORD_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="♻️ ポジション復元",
+                description=f"再起動前の **{restored}** ポジションをAlpacaから復元しました\n（SLは現在ATRで再計算済み）",
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            await channel.send(embed=embed)
+
+    # スラッシュコマンドを Discord に同期
+    await tree.sync()
+    log.info("Slash commands synced.")
 
     # シグナルハンドラを登録（SIGTERM / SIGINT でグレースフル停止）
     loop = asyncio.get_running_loop()

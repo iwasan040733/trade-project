@@ -66,6 +66,9 @@ class AutoTrader:
         # 1日1回制限: {symbol: "YYYY-MM-DD"}
         self._daily_trade_done: dict[str, str] = {}
 
+        # 手動オーバーライド
+        self.long_disabled: bool = False  # /long_disable コマンドで有効化
+
         # QQQ レジーム
         self._qqq_ratio: float = 0.5
         self._qqq_regime: str | None = None
@@ -76,6 +79,10 @@ class AutoTrader:
         # VIX パニック
         self._vix_panic: bool = False
         self._vix_panic_date: datetime | None = None
+
+        # VIXフィルター（マクロ連動銘柄用）: {date: prev_day_close}
+        self._vix_filter_cache: dict = {}   # {date obj: float}
+        self._vix_filter_cache_date: datetime | None = None
 
         # 決算ブラックアウトキャッシュ
         self._earnings_cache: dict[str, tuple] = {}
@@ -241,6 +248,30 @@ class AutoTrader:
         except Exception:
             return False
 
+    def _get_prev_vix_close(self) -> float | None:
+        """前日VIX終値を返す（1日1回キャッシュ）。取得失敗時は None。"""
+        if not config.VIX_FILTER_ENABLED:
+            return None
+        today = datetime.now(timezone.utc)
+        # 当日キャッシュ済みなら即返す
+        if (self._vix_filter_cache_date is not None
+                and self._vix_filter_cache_date.date() == today.date()
+                and self._vix_filter_cache):
+            return self._vix_filter_cache.get(today.date())
+        try:
+            import yfinance as yf
+            hist = yf.Ticker(config.VIX_SYMBOL).history(period="5d")
+            if hist is None or len(hist) < 2:
+                return None
+            prev_close = float(hist["Close"].iloc[-2])
+            self._vix_filter_cache = {today.date(): prev_close}
+            self._vix_filter_cache_date = today
+            log.debug(f"[VIXFilter] 前日VIX終値={prev_close:.2f}")
+            return prev_close
+        except Exception as e:
+            log.debug(f"[VIXFilter] VIX取得失敗: {e}")
+            return None
+
     # ----------------------------------------------------------
     #  空売り可否
     # ----------------------------------------------------------
@@ -262,6 +293,94 @@ class AutoTrader:
         return sum(1 for p in self.positions if not p.closed)
 
     # ----------------------------------------------------------
+    #  再起動時ポジション復元
+    # ----------------------------------------------------------
+    def restore_positions(self) -> int:
+        """再起動時に Alpaca の既存ポジションを self.positions に復元する。
+
+        エントリー時の ATR は失われているため、現在の5分足から再計算。
+        SL も ATR × BREAKOUT_STOP_ATR_MULT で再設定する。
+
+        Returns:
+            復元したポジション数
+        """
+        # inverse ETF → シグナルシンボルの逆引きマップ (例: SOXS→SOXL)
+        inverse_map = {v: k for k, v in config.SYMBOL_SHORT_SUBSTITUTE.items()}
+        managed_symbols = (
+            set(config.SNIPER_SYMBOLS) | set(config.SYMBOL_SHORT_SUBSTITUTE.values())
+        )
+        today_str = datetime.now(ET).strftime("%Y-%m-%d")
+
+        try:
+            alpaca_positions = self.trading_client.get_all_positions()
+        except Exception as e:
+            log.warning(f"[Restore] Alpacaポジション取得失敗: {e}")
+            return 0
+
+        restored = 0
+        for ap in alpaca_positions:
+            symbol = ap.symbol
+            if symbol not in managed_symbols:
+                continue
+
+            entry_price = float(ap.avg_entry_price)
+            qty = abs(int(float(ap.qty)))
+            side = "long" if float(ap.qty) > 0 else "short"
+            current_price = float(ap.current_price)
+
+            # 現在の ATR を5分足から再計算
+            atr_v = 0.0
+            df5 = self._fetch_5min_bars(symbol, hours=4)
+            if df5 is not None and len(df5) >= 15:
+                atr_series = ta.atr(df5["high"], df5["low"], df5["close"], length=14)
+                if atr_series is not None and not pd.isna(atr_series.iloc[-1]):
+                    atr_v = float(atr_series.iloc[-1])
+            if atr_v <= 0:
+                atr_v = entry_price * 0.01  # フォールバック: 価格の1%
+                log.warning(f"[Restore] {symbol} ATR取得失敗 — フォールバック ATR=${atr_v:.2f}")
+
+            if side == "long":
+                sl_price = entry_price - atr_v * config.BREAKOUT_STOP_ATR_MULT
+                highest_price = max(entry_price, current_price)
+                lowest_price = 0.0
+            else:
+                sl_price = entry_price + atr_v * config.BREAKOUT_STOP_ATR_MULT
+                highest_price = 0.0
+                lowest_price = min(entry_price, current_price)
+
+            position = AutoPosition(
+                symbol=symbol,
+                entry_price=entry_price,
+                qty=qty,
+                order_id="restored",
+                stop_loss_price=sl_price,
+                atr_value=atr_v,
+                atr_pct=round((atr_v / entry_price) * 100, 2),
+                side=side,
+                strategy="breakout",
+                highest_price=highest_price,
+                lowest_price=lowest_price,
+            )
+            self.positions.append(position)
+
+            # 同方向の重複エントリー防止
+            signal_symbol = inverse_map.get(symbol, symbol)
+            self._daily_trade_done[f"{signal_symbol}:{side}"] = today_str
+
+            restored += 1
+            log.info(
+                f"[Restore] {symbol} [{side}] qty={qty} "
+                f"entry=${entry_price:.2f} SL=${sl_price:.2f} ATR=${atr_v:.2f}"
+            )
+
+        if restored:
+            log.info(f"[Restore] 合計 {restored} ポジション復元")
+        else:
+            log.info("[Restore] 復元すべきポジションなし")
+
+        return restored
+
+    # ----------------------------------------------------------
     #  エントリー: スナイパー型ブレイクアウト/ブレイクダウン
     # ----------------------------------------------------------
     def check_entries(self) -> list[AutoPosition]:
@@ -280,9 +399,6 @@ class AutoTrader:
         for sym in config.SNIPER_SYMBOLS:
             if self.open_position_count >= config.MAX_POSITIONS:
                 break
-            # 1日1回制限
-            if self._daily_trade_done.get(sym) == today_str:
-                continue
             # 既にポジションあり
             if any(p.symbol == sym and not p.closed for p in self.positions):
                 continue
@@ -388,6 +504,25 @@ class AutoTrader:
         if entry_side is None:
             return None
 
+        # ロング無効化モード（手動オーバーライド）
+        if entry_side == "long" and self.long_disabled:
+            log.info(f"{symbol} ロング無効化モード中 — スキップ")
+            return None
+
+        # 同方向の1日1回制限（ロング損切り後にショートは可）
+        if self._daily_trade_done.get(f"{symbol}:{entry_side}") == today_str:
+            log.debug(f"{symbol} {entry_side}は本日既にトレード済み — スキップ")
+            return None
+
+        # === VIXフィルター: マクロ連動銘柄 × 前日VIX < 閾値 → 閑散相場としてスキップ ===
+        if config.VIX_FILTER_ENABLED and symbol in config.VIX_FILTER_SYMBOLS:
+            prev_vix = self._get_prev_vix_close()
+            if prev_vix is not None and prev_vix < config.VIX_FILTER_THRESHOLD:
+                log.info(
+                    f"[VIXFilter] {symbol} スキップ — 前日VIX={prev_vix:.2f} < {config.VIX_FILTER_THRESHOLD}"
+                )
+                return None
+
         # === Volume Spike ===
         short_window = config.BREAKOUT_VOL_SPIKE_SHORT
         long_window = config.BREAKOUT_VOL_SPIKE_LONG
@@ -423,7 +558,7 @@ class AutoTrader:
                 return None
 
         # === 全フィルター通過 → エントリー ===
-        self._daily_trade_done[symbol] = today_str
+        self._daily_trade_done[f"{symbol}:{entry_side}"] = today_str
         qty = self._calc_qty(price)
         sl_dist = atr_v * config.BREAKOUT_STOP_ATR_MULT
         tp_dist = atr_v * config.BREAKOUT_TP_ATR_MULT if config.BREAKOUT_TP_ATR_MULT > 0 else 0
@@ -474,7 +609,7 @@ class AutoTrader:
             return None
         atr_v = float(atr_series.iloc[-1])
 
-        self._daily_trade_done[signal_symbol] = today_str
+        self._daily_trade_done[f"{signal_symbol}:short"] = today_str
         qty = self._calc_qty(price)
         sl_dist = atr_v * config.BREAKOUT_STOP_ATR_MULT
         sl_price = round(price - sl_dist, 2)

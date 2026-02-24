@@ -32,7 +32,7 @@ BUY_QTY = 1                        # 買い注文の株数（手動）
 # ============================================================
 ACCOUNT_SIZE = 6700                # 運用資金 $6,700（100万円相当）
 RISK_PER_TRADE = 0.01              # 1トレードのリスク = 資金の 1%（$67）
-MAX_POSITIONS = 3                  # 最大同時ポジション数
+MAX_POSITIONS = 10                 # 上限を撤廃（実質はACCOUNT_SIZE÷POSITION_SIZEで制限）
 MAX_POSITION_PCT = 0.35            # 1銘柄の最大ポジション比率 35%
 
 POSITION_SIZE = 2000               # バックテスト用（3銘柄分散: $2,000 × 3）
@@ -105,14 +105,14 @@ AUTO_TRADE_INTERVAL_SECONDS = 30   # 30秒ごとに判定
 AUTO_SYMBOLS_COUNT = 10
 AUTO_SYMBOLS_FETCH_TOP = 50            # MostActives から多めに取得
 AUTO_SYMBOLS_MIN_PRICE = 20.0          # $20以上の銘柄のみ（小型・ペニー株除外）
-AUTO_SYMBOLS_FALLBACK = ["COIN", "MARA", "MSTR", "SOXL", "SMCI"]
+AUTO_SYMBOLS_FALLBACK = ["COIN", "SOXL", "SMCI", "TQQQ", "TSLA"]
 
 # スナイパー型 固定銘柄（自動売買で使用）
-SNIPER_SYMBOLS = ["COIN", "MARA", "MSTR", "SOXL", "SMCI"]
+SNIPER_SYMBOLS = ["COIN", "SOXL", "SMCI", "TQQQ", "TSLA"]
 
 # ショート代替シンボル: ショートシグナル発生時にインバースETFをロング買いで代替エントリー
 # 例: SOXLのショートシグナル → SOXSをロング買い（空売り不要）
-SYMBOL_SHORT_SUBSTITUTE: dict[str, str] = {"SOXL": "SOXS"}
+SYMBOL_SHORT_SUBSTITUTE: dict[str, str] = {"SOXL": "SOXS", "TQQQ": "SQQQ"}
 
 # 決算ブラックアウト（決算発表前後は自動停止）
 EARNINGS_BLACKOUT_HOURS = 24       # 決算前後 24 時間は取引停止
@@ -198,4 +198,10 @@ VIX_PANIC_ENABLED = True
 VIX_PANIC_THRESHOLD = 0.10            # VIX 前日比 +10% でパニックモード
 VIX_SYMBOL = "^VIX"                   # yfinance 用シンボル
 VIX_CACHE_SECONDS = 300               # VIX キャッシュ（5分）
+
+# VIXフィルター（低ボラ閑散相場の除外）
+VIX_FILTER_ENABLED = True
+VIX_FILTER_THRESHOLD = 15.0           # 前日VIX < 15 → 閑散相場としてエントリーしない
+# マクロ連動銘柄のみに適用（BTC/クリプト相関が強くマクロ感応度が高い銘柄）
+VIX_FILTER_SYMBOLS = ["COIN", "MARA", "MSTR"]
 
