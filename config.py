@@ -108,17 +108,32 @@ AUTO_SYMBOLS_MIN_PRICE = 20.0          # $20以上の銘柄のみ（小型・ペ
 AUTO_SYMBOLS_FALLBACK = ["COIN", "SOXL", "SMCI", "TQQQ", "TSLA"]
 
 # スナイパー型 固定銘柄（自動売買で使用）
-SNIPER_SYMBOLS = ["COIN", "SOXL", "SMCI", "TQQQ", "TSLA"]
+SNIPER_SYMBOLS = [
+    "COIN", "SOXL", "SMCI", "TQQQ", "TSLL",   # 既存（TSLAをTSLL 2xに変更）
+    "LABU", "DPST", "TNA",                       # レバレッジETF（第1弾、FNGUをDPSTに変更）
+    "RIOT", "PLTR", "NVDA", "AMD", "BITX",       # 個別株・暗号資産ETF
+    "SPXL", "HUT", "BULZ",                       # レバレッジETF・暗号マイニング（第2弾）
+    "CORZ", "CIFR",                              # 暗号マイニング（第3弾、4/09非依存）
+]
 
 # ショート代替シンボル: ショートシグナル発生時にインバースETFをロング買いで代替エントリー
 # 例: SOXLのショートシグナル → SOXSをロング買い（空売り不要）
-SYMBOL_SHORT_SUBSTITUTE: dict[str, str] = {"SOXL": "SOXS", "TQQQ": "SQQQ"}
+SYMBOL_SHORT_SUBSTITUTE: dict[str, str] = {
+    "SOXL": "SOXS",
+    "TQQQ": "SQQQ",
+    "LABU": "LABD",
+    "TNA":  "TZA",
+    "BITX": "SBIT",
+    "SPXL": "SPXS",
+    "BULZ": "BERZ",
+    "TSLL": "TSLS",
+}
 
 # 決算ブラックアウト（決算発表前後は自動停止）
 EARNINGS_BLACKOUT_HOURS = 24       # 決算前後 24 時間は取引停止
 
 # エントリー時間制限（ノイズの多い寄り付き・引けを回避）
-ENTRY_BUFFER_MINUTES_OPEN = 15    # 寄り付き後 15 分はエントリーしない（9:45 ET〜）
+ENTRY_BUFFER_MINUTES_OPEN = 60    # 寄り付き後 60 分はエントリーしない（10:30 ET〜）
 ENTRY_BUFFER_MINUTES_CLOSE = 30   # 引け前 30 分はエントリーしない（〜15:30 ET）
 
 # エントリー条件
@@ -204,4 +219,37 @@ VIX_FILTER_ENABLED = True
 VIX_FILTER_THRESHOLD = 15.0           # 前日VIX < 15 → 閑散相場としてエントリーしない
 # マクロ連動銘柄のみに適用（BTC/クリプト相関が強くマクロ感応度が高い銘柄）
 VIX_FILTER_SYMBOLS = ["COIN", "MARA", "MSTR"]
+
+# ============================================================
+#  動的銘柄追加（毎日出来高ランキングで中小型株を追加監視）
+# ============================================================
+DYNAMIC_SYMBOLS_ENABLED = True
+DYNAMIC_TOP_N = 5                  # 毎日追加する最大銘柄数（事前候補から）
+DYNAMIC_MAX_PRICE = 100.0          # 中小型フィルター: 価格 < $100 の銘柄のみ対象
+DYNAMIC_MIN_PRICE = 3.0            # 最低株価（ペニー株除外）
+
+# MostActives 動的発見（バックテスト対象外・ライブのみ）
+DYNAMIC_MOST_ACTIVES_ENABLED = True
+DYNAMIC_MOST_ACTIVES_TOP_N = 3         # MostActivesから新規発見する最大銘柄数
+DYNAMIC_MOST_ACTIVES_FETCH_TOP = 50    # Alpaca MostActives 取得件数
+DYNAMIC_MOST_ACTIVES_MIN_TRADES = 20_000  # 最低取引回数（ブロック取引・薄商い除外）
+
+# 動的追加の候補ユニバース（中小型・ボラタイル）
+# SNIPER_SYMBOLSと重複OK（固定として既に監視中なら動的追加は実質スキップされる）
+DYNAMIC_UNIVERSE = [
+    # クリプトマイニング
+    "MARA", "MSTR", "CLSK", "WULF", "BTBT", "IREN", "BITF",
+    # AI・量子コンピュータ
+    "SOUN", "IONQ", "RGTI", "QBTS", "BBAI", "ARQQ",
+    # 宇宙・新興
+    "ASTS", "RKLB", "LUNR", "ACHR",
+    # EV・輸送
+    "RIVN", "LCID", "NIO",
+    # フィンテック
+    "HOOD", "SOFI", "AFRM", "UPST",
+    # ゲーム・SNS
+    "RBLX", "SNAP",
+    # その他中小型
+    "SMCI", "RIOT", "APP",
+]
 

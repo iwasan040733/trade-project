@@ -284,10 +284,9 @@ def run_backtest(symbols, days, start_date=None, end_date=None, btc_filter_overr
 
     market_open = dtime(config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
     market_close = dtime(config.MARKET_CLOSE_HOUR, config.MARKET_CLOSE_MINUTE)
-    entry_start = dtime(
-        config.MARKET_OPEN_HOUR,
-        config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN,
-    )
+    from datetime import datetime as _dt
+    _open_dt = _dt(2000, 1, 1, config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
+    entry_start = (_open_dt + timedelta(minutes=config.ENTRY_BUFFER_MINUTES_OPEN)).time()
 
     for sym in symbols:
         if sym not in sym_data:

@@ -22,6 +22,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+try:
+    from alpaca.data import ScreenerClient, MostActivesRequest, MostActivesBy
+    _SCREENER_AVAILABLE = True
+except ImportError:
+    _SCREENER_AVAILABLE = False
+
 import config
 from models import AutoPosition
 from indicators import calc_qqq_regime_hybrid
@@ -43,10 +49,8 @@ def is_entry_window() -> bool:
     now_et = datetime.now(ET)
     if now_et.weekday() >= 5:
         return False
-    entry_start = time(
-        config.MARKET_OPEN_HOUR,
-        config.MARKET_OPEN_MINUTE + config.ENTRY_BUFFER_MINUTES_OPEN,
-    )
+    _open_dt = datetime(2000, 1, 1, config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
+    entry_start = (_open_dt + timedelta(minutes=config.ENTRY_BUFFER_MINUTES_OPEN)).time()
     entry_end = time(15, 30)  # 15:30 ET
     return entry_start <= now_et.time() < entry_end
 
@@ -86,6 +90,11 @@ class AutoTrader:
 
         # 決算ブラックアウトキャッシュ
         self._earnings_cache: dict[str, tuple] = {}
+
+        # 動的銘柄選定（毎日 10:30 ET 以降に一度だけ実行）
+        self._dynamic_symbols: list[str] = []       # 事前候補から選定
+        self._dynamic_new_symbols: list[str] = []   # MostActives新規発見（未知）
+        self._dynamic_selection_date: str = ""      # "YYYY-MM-DD"
 
     # ----------------------------------------------------------
     #  データ取得
@@ -273,6 +282,135 @@ class AutoTrader:
             return None
 
     # ----------------------------------------------------------
+    #  動的銘柄選定（毎日 10:30 ET 以降に一度）
+    # ----------------------------------------------------------
+    def _update_dynamic_symbols(self) -> None:
+        """9:30〜10:25 ET のドル出来高上位かつ価格 < DYNAMIC_MAX_PRICE の銘柄を最大 DYNAMIC_TOP_N 件選定。"""
+        if not config.DYNAMIC_SYMBOLS_ENABLED:
+            return
+        today_str = datetime.now(ET).strftime("%Y-%m-%d")
+        if self._dynamic_selection_date == today_str:
+            return  # 本日分は選定済み
+
+        # entry_start (10:30 ET) 以降のみ実行
+        now_et = datetime.now(ET)
+        _open_dt = datetime(2000, 1, 1, config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
+        entry_start = (_open_dt + timedelta(minutes=config.ENTRY_BUFFER_MINUTES_OPEN)).time()
+        if now_et.time() < entry_start:
+            return
+
+        log.info("[Dynamic] 本日の動的銘柄選定を開始...")
+        market_open_t = time(config.MARKET_OPEN_HOUR, config.MARKET_OPEN_MINUTE)
+        dv_map: dict[str, float] = {}
+
+        for sym in config.DYNAMIC_UNIVERSE:
+            try:
+                # 最大8時間前まで遡って取得（遅い起動時でも 9:30 ET をカバー）
+                df5 = self._fetch_5min_bars(sym, hours=8)
+                if df5 is None or df5.empty:
+                    continue
+                c5 = df5["close"].astype(float)
+                v5 = df5["volume"].astype(float)
+
+                dv = 0.0
+                price_sum = 0.0
+                count = 0
+                for i, ts in enumerate(df5.index):
+                    ts_et = ts.astimezone(ET) if ts.tzinfo else ts.tz_localize("UTC").astimezone(ET)
+                    # 当日の 9:30〜10:25 ET バーのみ集計
+                    if ts_et.date() != now_et.date():
+                        continue
+                    bt = ts_et.time()
+                    if bt < market_open_t or bt >= entry_start:
+                        continue
+                    vol = float(v5.iloc[i])
+                    close = float(c5.iloc[i])
+                    dv += vol * close
+                    price_sum += close
+                    count += 1
+
+                if count == 0 or dv <= 0:
+                    continue
+                avg_price = price_sum / count
+                if avg_price > config.DYNAMIC_MAX_PRICE:
+                    continue  # 中小型フィルター
+                dv_map[sym] = dv
+            except Exception as e:
+                log.debug(f"[Dynamic] {sym} データ取得失敗: {e}")
+
+        sorted_syms = sorted(dv_map.items(), key=lambda x: x[1], reverse=True)
+        selected = [s for s, _ in sorted_syms[:config.DYNAMIC_TOP_N]]
+
+        self._dynamic_symbols = selected
+        if selected:
+            dv_strs = [f"{s}(${dv_map[s]/1e6:.1f}M)" for s in selected]
+            log.info(f"[Dynamic] 事前候補から選定: {', '.join(dv_strs)}")
+        else:
+            log.info("[Dynamic] 事前候補からの追加銘柄なし")
+
+        # --- MostActives 新規発見（バックテスト対象外） ---
+        new_discoveries: list[str] = []
+        if config.DYNAMIC_MOST_ACTIVES_ENABLED and _SCREENER_AVAILABLE:
+            try:
+                already_monitored = (
+                    set(config.SNIPER_SYMBOLS)
+                    | set(config.SYMBOL_SHORT_SUBSTITUTE.values())
+                    | set(config.DYNAMIC_UNIVERSE)
+                    | set(selected)
+                )
+                screener = ScreenerClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+                req = MostActivesRequest(
+                    top=config.DYNAMIC_MOST_ACTIVES_FETCH_TOP,
+                    by=MostActivesBy.VOLUME,
+                )
+                res = screener.get_most_actives(req)
+
+                # フィルター1: 既存監視外 + 最低取引回数
+                candidates = [
+                    item for item in res.most_actives
+                    if item.symbol not in already_monitored
+                    and item.trade_count >= config.DYNAMIC_MOST_ACTIVES_MIN_TRADES
+                ]
+
+                if candidates:
+                    # 価格取得（バッチ）
+                    cand_syms = [item.symbol for item in candidates[:30]]
+                    try:
+                        quotes = self.data_client.get_stock_latest_quote(
+                            StockLatestQuoteRequest(symbol_or_symbols=cand_syms)
+                        )
+                    except Exception:
+                        quotes = {}
+
+                    # フィルター2: 価格範囲 → ドル出来高でランク付け
+                    dv_new: dict[str, float] = {}
+                    for item in candidates:
+                        sym = item.symbol
+                        if sym not in quotes:
+                            continue
+                        q = quotes[sym]
+                        bid, ask = float(q.bid_price), float(q.ask_price)
+                        price = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+                        if price < config.DYNAMIC_MIN_PRICE or price > config.DYNAMIC_MAX_PRICE:
+                            continue
+                        dv_new[sym] = item.volume * price
+
+                    sorted_new = sorted(dv_new.items(), key=lambda x: x[1], reverse=True)
+                    new_discoveries = [s for s, _ in sorted_new[:config.DYNAMIC_MOST_ACTIVES_TOP_N]]
+
+                if new_discoveries:
+                    dv_strs_new = [f"{s}(${dv_new[s]/1e6:.1f}M)" for s in new_discoveries]
+                    log.info(f"[Dynamic] MostActives新規発見[未知]: {', '.join(dv_strs_new)}")
+                else:
+                    log.info("[Dynamic] MostActivesからの新規発見なし（フィルター後）")
+
+            except Exception as e:
+                log.warning(f"[Dynamic] MostActives取得失敗: {e}")
+
+        self._dynamic_new_symbols = new_discoveries
+        self._dynamic_selection_date = today_str
+
+    # ----------------------------------------------------------
     #  空売り可否
     # ----------------------------------------------------------
     def _check_shortable(self, symbol: str) -> bool:
@@ -307,7 +445,10 @@ class AutoTrader:
         # inverse ETF → シグナルシンボルの逆引きマップ (例: SOXS→SOXL)
         inverse_map = {v: k for k, v in config.SYMBOL_SHORT_SUBSTITUTE.items()}
         managed_symbols = (
-            set(config.SNIPER_SYMBOLS) | set(config.SYMBOL_SHORT_SUBSTITUTE.values())
+            set(config.SNIPER_SYMBOLS)
+            | set(config.SYMBOL_SHORT_SUBSTITUTE.values())
+            | set(config.DYNAMIC_UNIVERSE)
+            # MostActives新規発見銘柄のポジションも復元するため上限なしで全ポジションを対象にする
         )
         today_str = datetime.now(ET).strftime("%Y-%m-%d")
 
@@ -321,7 +462,8 @@ class AutoTrader:
         for ap in alpaca_positions:
             symbol = ap.symbol
             if symbol not in managed_symbols:
-                continue
+                # MostActives新規発見銘柄の可能性: 警告を出しつつ復元
+                log.info(f"[Restore] {symbol} は既知リスト外（MostActives動的発見の可能性）— 復元試みます")
 
             entry_price = float(ap.avg_entry_price)
             qty = abs(int(float(ap.qty)))
@@ -393,10 +535,18 @@ class AutoTrader:
             return []
 
         self._update_market_regime()
+        self._update_dynamic_symbols()
         today_str = datetime.now(ET).strftime("%Y-%m-%d")
 
+        # 固定SNIPER_SYMBOLS + 事前候補動的 + MostActives新規発見（重複除去・順序維持）
+        symbols_to_check = list(dict.fromkeys(
+            list(config.SNIPER_SYMBOLS)
+            + self._dynamic_symbols
+            + self._dynamic_new_symbols
+        ))
+
         new_positions = []
-        for sym in config.SNIPER_SYMBOLS:
+        for sym in symbols_to_check:
             if self.open_position_count >= config.MAX_POSITIONS:
                 break
             # 既にポジションあり
@@ -405,6 +555,12 @@ class AutoTrader:
 
             pos = self._try_breakout_entry(sym, today_str)
             if pos is not None:
+                if sym in self._dynamic_new_symbols:
+                    pos.support_name += " [未知]"
+                    log.info(f"[Dynamic] {sym} MostActives新規発見からのエントリー")
+                elif sym in self._dynamic_symbols:
+                    pos.support_name += " [動的]"
+                    log.info(f"[Dynamic] {sym} 事前候補動的追加からのエントリー")
                 new_positions.append(pos)
 
         return new_positions
